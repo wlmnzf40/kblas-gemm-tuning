@@ -1,0 +1,42 @@
+syntax = "proto3";
+package gemm;
+
+service GEMMService {
+  // Client sends A, B matrices; server runs tf.matmul and returns C + compute time.
+  rpc Compute (ComputeRequest) returns (ComputeResponse);
+  // Server benchmarks multiple square sizes internally; returns latency table.
+  rpc Sweep (SweepRequest) returns (SweepResponse);
+}
+
+message ComputeRequest {
+  repeated float a_data = 1;   // row-major, shape [M, K]
+  repeated float b_data = 2;   // row-major, shape [K, N]
+  int32 M = 3;
+  int32 K = 4;
+  int32 N = 5;
+}
+
+message ComputeResponse {
+  repeated float c_data = 1;   // row-major, shape [M, N]
+  double server_compute_ms = 2;
+}
+
+message SweepRequest {
+  repeated int32 sizes = 1;
+  int32 iters  = 2;
+  int32 warmup = 3;
+}
+
+message SweepResult {
+  int32  M      = 1;
+  int32  K      = 2;
+  int32  N      = 3;
+  double avg_ms = 4;
+  double p50_ms = 5;
+  double p99_ms = 6;
+  double gflops = 7;
+}
+
+message SweepResponse {
+  repeated SweepResult results = 1;
+}

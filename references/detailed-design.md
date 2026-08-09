@@ -163,7 +163,7 @@ Compare --> Result
 
 ## 3. 组件设计
 
-### 组件一：分析对象与基线管理
+### 组件一：目标环境与 KML 能力识别
 
 #### 3.1 组件功能整体流程
 
@@ -172,75 +172,60 @@ Compare --> Result
 skinparam defaultFontName "Microsoft YaHei"
 skinparam defaultFontSize 10
 start
-:记录硬件、OS、编译器与框架版本;
-:获取源码、依赖和候选优化库;
-:定义数据类型、shape、并发和统计指标;
-:构建未优化版本;
-:固定 CPU 亲和性与线程配置;
-:执行 warmup 和多轮采样;
-:保存原始延迟、GFLOPS 与资源指标;
+:接收目标仓、目标二进制和构建目录;
+:执行 uname -m 确认处理器架构;
+if (是否为 aarch64?) then (否)
+  :标记为非本 Skill 目标平台并停止替换;
+  stop
+endif
+:读取 lscpu 与 /proc/cpuinfo 的 Features;
+if (支持 SVE?) then (是)
+  :选择 KML SVE 库目录;
+else (否)
+  :选择 KML NEON 兼容库目录;
+endif
+:记录 OS、CPU、编译器、KML 版本和库路径;
+:输出平台能力与 KML 库选择结果;
 stop
 @enduml
 ```
 
-**通用流程说明**：
+**流程说明**：
 
-1. **目标仓扫描**：检查构建文件和源码中的数学库依赖、头文件、显式 API 调用以及框架级数学操作，形成候选操作清单。扫描结果只是候选集合，是否替换仍由运行时热点和 KML 接口匹配决定。
-2. **对象边界**：明确待优化的是目标仓中的数学计算路径，而不是默认把完整程序耗时归因到数学库。对服务程序还要区分内核计算时间和客户端 RTT。
-3. **Workload 选择**：选择能够代表真实业务的数据规模、参数组合和并发模式；对于 GEMM，不能只使用单个方阵，应覆盖典型 M×K×N。
-4. **运行条件**：记录 CPU 型号、NUMA、频率策略、CPU affinity、线程数和系统负载。优化前后仅允许改变被比较的数学内核实现。
-5. **统计口径**：通用指标包括 avg、P50、P99、吞吐和 CPU 资源；GEMM 案例额外使用 GFLOPS，并按 `2*M*K*N / seconds / 1e9` 计算。
-
-**案例落地：TensorFlow Serving 使用 KML**：
-
-通用流程中的“准备对象、固定 Workload、生成原始基线”，在本案例中对应以下操作：
-
-1. 使用与目标环境一致的 TF Serving 2.17.0 工作树，并优先复用已经成功构建的 Bazel `output_base` 与 `DISTDIR`。
-2. 将 `deployment/tf_serving_gemm` 作为 Bazel package 集成到目标工作树。server 构造动态形状 Placeholder 和 `MatMul` 图，client 通过 gRPC 执行单次 Compute 或方阵 Sweep。
-3. 在应用 KML patch 之前先生成 Eigen 基线。Graph 和 `ClientSession` 在进程内复用，避免每次请求重建图。
-4. 将 KML aarch64 RPM 作为本案例的候选实现；无 root 环境通过 `rpm2cpio` 解包到 TF Serving 的 `third_party/kml`，避免 Bazel execution root 拒绝外部 include 路径。
+1. **架构确认**：首先执行 `uname -m`，只有目标环境为 `aarch64` 时才进入 KML 鲲鹏亲和替换流程；其他架构只输出识别结果，不执行库替换。
+2. **CPU 能力确认**：通过 `lscpu` 和 `/proc/cpuinfo` 检查 `sve` 特征，不能仅依据 CPU 型号推断指令集。
+3. **库目录决策**：检测到 SVE 时优先使用 KML SVE 实现；仅支持 NEON 或无法可靠确认特征时使用 NEON 实现，优先保证兼容性。
+4. **环境留档**：记录 kernel、CPU、NUMA、编译器、KML 版本和最终选择的动态库路径，后续构建与性能测试必须使用同一结果。
+5. **案例映射**：TensorFlow Serving 案例除上述通用检查外，还记录 Bazel 7.4.1、GCC 12.3.1、TF Serving commit、`DISTDIR` 和 Bazel `output_base`，并避免执行 `bazel clean --expunge`。
 
 #### 3.2 接口设计
 
-**Skill 调用契约**：
-
-| 类型 | 字段 | 说明 |
-| --- | --- | --- |
-| 输入 | `repository` | 待分析的目标软件仓路径与源码版本 |
-| 输入 | `platform` | 鲲鹏 CPU、OS、编译器以及 KML 可用信息 |
-| 输入 | `build` | 原软件构建命令、依赖缓存和产物位置 |
-| 输入 | `workload` | 可重复执行的运行命令、输入规模、预热和采样要求 |
-| 输出 | `math_operations` | 发现的数学依赖、显式调用、框架间接调用及证据位置 |
-| 输出 | `replacement_plan` | KML 可替换性、接口语义映射、风险与回退条件 |
-| 输出 | `artifacts` | 补丁、构建配置、日志、符号检查和性能报告 |
-
-独立使用时由用户逐项提供或确认这些输入；被其他 Skill 调用时由调用方传递相同字段，并读取相同输出，不另设一套执行逻辑。
-
 ```bash
-git clone --branch 2.17.0 <TF_SERVING_GIT_URL> "$REPO"
+uname -m
+lscpu | rg -i 'sve|neon'
+awk '/^Features/{for(i=2;i<=NF;i++) print $i; exit}' /proc/cpuinfo | \
+  rg -i 'sve|asimd'
 
-wget -O /tmp/boostkit-kml-1.7.0-1.aarch64.rpm \
-  https://repo.oepkgs.net/openeuler/rpm/openEuler-20.03-LTS-SP3/extras/aarch64/Packages/b/boostkit-kml-1.7.0-1.aarch64.rpm
-mkdir -p "$REPO/third_party/kml"
-rpm2cpio /tmp/boostkit-kml-1.7.0-1.aarch64.rpm | \
-  cpio -idmv --no-absolute-filenames -D "$REPO/third_party/kml"
-
-git -C "$REPO" rev-parse HEAD
-sha256sum /tmp/boostkit-kml-1.7.0-1.aarch64.rpm
-"$BAZEL" --version
+if lscpu | rg -qi 'sve'; then
+  KML_ARCH=sve
+  KML_LIB=/usr/local/kml/lib/sve
+else
+  KML_ARCH=neon
+  KML_LIB=/usr/local/kml/lib/neon
+fi
 ```
 
-`<TF_SERVING_GIT_URL>` 由项目实际代码托管地址替换。离线环境应预先将 RPM 和 Bazel 依赖放入受控制品库或 `DISTDIR`，不得在不同测试轮次临时切换依赖来源。
+若 KML 以 RPM 无 root 解包到目标仓，`KML_LIB` 应改为 `third_party/kml` 下实际包含对应 SVE/NEON 动态库的目录。目录不存在时输出阻塞项，不得静默选择其他来源的同名库。
 
 #### 3.3 存储数据设计及描述
 
-- **环境记录**：TF Serving commit、Bazel/GCC 版本、OS/kernel、CPU、KML RPM SHA-256。
-- **Workload 记录**：shape、数据类型、随机种子、warmup、iters、并发和线程配置。
-- **基线记录**：原始逐次采样与汇总表分别保存，避免只保留平均值。
+- `platform.json`：架构、CPU feature、OS/kernel、编译器和 NUMA 信息。
+- `kml-selection.json`：KML 版本、制品校验值、SVE/NEON 决策、include 与 lib 路径。
+- TensorFlow Serving 案例额外记录 Bazel 版本、TF commit、`DISTDIR` 与 `output_base`。
 
 ---
 
-### 组件二：热点识别与替换点决策
+### 组件二：目标项目数学函数热点分析
 
 #### 3.1 组件功能整体流程
 
@@ -249,81 +234,93 @@ sha256sum /tmp/boostkit-kml-1.7.0-1.aarch64.rpm
 skinparam defaultFontName "Microsoft YaHei"
 skinparam defaultFontSize 10
 start
-:运行稳定且可重复的业务负载;
-:perf stat 观察 CPU 与缓存特征;
-:perf record 采集进程全部线程调用栈;
-if (调用栈完整且样本足够?) then (是)
-  :确认 GEMM 热点及其上层调用者;
+:使用 ldd 检查目标二进制数学库依赖;
+:检查构建参数、find_package 和源码 include;
+:生成已用数学库与候选调用清单;
+if (perf 可用且目标程序可运行?) then (是)
+  :对目标进程采集 60 秒调用栈;
+  :按热点符号分类 KBLAS/KSVML/KFFT/KLAPACK 候选;
 else (否)
-  :检查 perf 权限、符号、DWARF/frame pointer 和采样窗口;
-  if (重试后仍无法定位?) then (是)
-    :执行源码、构建依赖和 ELF 静态分析;
-    :结论标记为“静态识别，待动态验证”;
-  else (否)
-    :重新采样;
-  endif
+  :记录 perf 不可用原因;
 endif
-:核对数据类型、布局、转置和 shape 分布;
-:输出候选替换点与不适用范围;
+:无条件执行源码静态扫描;
+:扫描 BLAS/Eigen、向量数学、FFT、LAPACK 调用;
+:扫描 include、链接参数和构建依赖;
+:合并动态热点与静态调用清单;
+:输出候选类型、调用位置、热点占比和证据来源;
 stop
 @enduml
 ```
 
-**通用流程说明**：
+**流程说明**：
 
-1. **动态分析优先**：`perf stat` 用于判断 cycles、instructions 和 cache miss 特征；`perf record -g` 用于回答“时间实际花在哪个调用链”。必须在采样期间持续施压。
-2. **不可定位诊断**：依次排查 `kernel.perf_event_paranoid`、binary strip、缺少 DWARF/frame pointer、模板内联、采样时长不足、负载过低和只采到主线程等问题。
-3. **静态分析边界**：静态分析只能证明代码和链接路径存在，不能证明生产请求一定执行该路径，因此静态结果必须保留限制说明。
-4. **替换决策**：除热点比例外，还要核对候选库是否支持数据类型、矩阵布局、转置、leading dimension、线程模型和典型 shape。
-
-**案例落地：在 TensorFlow Serving 中确认替换点**：
-
-通用流程要求从业务入口确认到 GEMM 内核的完整证据链。本案例将这条证据链具体映射为：
-
-1. 动态调用链从 TensorFlow executor/MatMul OpKernel 展开到 `Eigen::Tensor::contract`、`ParallelMatMulKernel` 或 SGEMM 相关符号；Eigen 模板大量内联时允许从邻近符号和源码位置组合判断。
-2. 静态兜底从 `server.cc` 的 `tfops::MatMul` 开始，检查 BUILD 中 `//tensorflow/cc:cc_ops`、`//tensorflow/core:core_cpu` 等依赖，再进入 Bazel `output_base/external/org_tensorflow` 查找 contraction 实现。
-3. 本期候选替换点限定为 FP32 contraction SGEMM。int8 路径和非 MatMul 热点不纳入 KBLAS 性能结论。
+1. **当前依赖识别**：对已构建项目使用 `ldd` 查找 BLAS、SLEEF、FFTW、LAPACK、libm、OpenBLAS、ATLAS、MKL 等库；同时扫描构建目录的链接参数和源码 include，覆盖静态链接或尚未进入最终 ELF 的依赖。
+2. **动态分析优先**：当 `perf` 可用且程序可运行时，对目标进程全部线程采集调用栈。动态证据用于确定真实 Workload 下的热点占比和调用者。
+3. **热点自动分类**：`sgemm/dgemm/gemm/matmul/contract` 归为 KBLAS 候选；`exp/log/sin/cos/tan/pow/sqrt` 归为 KSVML 候选；`fft/dft/rfft/cfft` 归为 KFFT 候选；`solve/factorize/inverse/ev/svd/qr` 归为 KLAPACK 候选。
+4. **静态分析始终执行**：静态扫描不是仅在 `perf` 失败时执行。即使已有 perf 结果，也要扫描源码和构建文件，因为运行时 Workload 可能未覆盖冷路径或低频功能。
+5. **perf 回退**：无 root 权限、内核工具版本不匹配、容器限制、目标项目尚未编译或无法运行时，记录原因后继续静态分析，不阻断候选发现。
+6. **证据合并**：动态命中标记热点占比，静态命中标记源码位置和调用形式；只有静态证据的候选注明“未被当前 Workload 动态覆盖”。
+7. **案例映射**：TensorFlow Serving 中除显式 BLAS 关键字外，还要识别 `tfops::MatMul`、`Eigen::Tensor::contract` 和 `ParallelMatMulKernel` 等框架间接调用，并追踪到 Bazel external TensorFlow 源码。
 
 #### 3.2 接口设计
 
-**动态分析接口**：
+**已链接数学库识别**：
 
 ```bash
-PID=$(pgrep -n gemm_server)
-perf stat -p "$PID" -e cycles,instructions,cache-references,cache-misses \
-  -- sleep 30
-perf record -F 99 -g --call-graph dwarf -p "$PID" -- sleep 60
-perf report --stdio --children --sort=dso,symbol > perf-report.txt
-perf script > perf-script.txt
+ldd <target_binary> | \
+  rg -i 'blas|sleef|fftw|lapack|libm|openblas|atlas|mkl|vec'
+rg -n -- '-l.*(blas|sleef|fftw|lapack)|-lm([^a-z]|$)' <build_dir>
+rg -n '#include.*(blas|sleef|fftw|lapack|m\.h|mkl)' <src_dir>
 ```
 
-若 binary 保留 frame pointer，可将 DWARF 改为开销较低的 `--call-graph fp`。`-p PID` 用于覆盖进程全部线程；不能用单个 TID 代替整个多线程服务。
-
-**静态识别接口**：
+**perf 动态采集**：
 
 ```bash
-OUTPUT_BASE=$("$BAZEL" info output_base)
-rg -n 'MatMul|Tensor::contract|ParallelMatMulKernel|dnnl_sgemm' \
-  deployment "$OUTPUT_BASE/external/org_tensorflow"
-nm -C bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_server | \
-  rg 'MatMul|contract|ParallelMatMulKernel|sgemm'
-readelf -Ws bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_server | \
-  rg 'MatMul|sgemm'
-objdump -dC bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_server | \
-  rg -n 'ParallelMatMulKernel|dnnl_sgemm|cblas_sgemm'
+if command -v perf >/dev/null 2>&1; then
+  perf record -F 99 -g -p <pid> -o /tmp/perf.data -- sleep 60
+  perf report -i /tmp/perf.data --stdio --no-children | \
+    awk '/^[[:space:]]+[0-9]/{print}' | head -20
+fi
 ```
 
-静态证据至少包含三层：Graph 存在 MatMul、构建依赖包含 CPU OpKernel、external TF 源码或 ELF 指向 contraction。若优化 binary 已 strip，应保存同 build-id 的未剥离 binary 或 Bazel 中间产物。
+**源码静态扫描**：
+
+```bash
+# KBLAS 候选：BLAS、Eigen GEMM 与框架 contraction
+rg -n -g '*.{c,cc,cpp,h,hpp}' \
+  'cblas_[sd]gem[mv]|[sd]gemm_|Eigen::Matrix|\.noalias\(\)|\.transpose\(\)|contract' \
+  <src_dir>
+
+# KSVML 候选：标量/向量数学函数与 SLEEF/其他向量数学库
+rg -n -g '*.{c,cc,cpp,h,hpp}' \
+  'Sleef_|sleef|expf?|log10?f?|sinf?|cosf?|tanf?|powf?|sqrtf?|tanhf?|_mm(256)?_.*(exp|log)|vd(Exp|Log)' \
+  <src_dir>
+
+# KFFT 候选
+rg -n -g '*.{c,cc,cpp,h,hpp}' \
+  'fftw_|FFTW_|cufft|DftiCompute|ne10_fft|kiss_fft' <src_dir>
+
+# KLAPACK 候选
+rg -n -g '*.{c,cc,cpp,h,hpp}' \
+  'LAPACKE_|lapacke_|[ds](gesv|potrf|syev)_|solve|factorize|inverse|svd|qr' \
+  <src_dir>
+
+# 构建依赖
+rg -n 'find_package.*(BLAS|FFTW|LAPACK|SLEEF)|-l(SLEEF|sleef|blas|openblas|atlas|mkl|fftw|lapack)' \
+  <src_dir> <build_dir>
+```
+
+扫描规则需要过滤测试、示例、第三方 vendor 和生成文件，避免把非目标代码误判为替换点；过滤目录及理由写入分析报告。
 
 #### 3.3 存储数据设计及描述
 
-- `perf.data` 必须与对应 binary、build-id、kernel 版本和压测参数一起归档。
-- 保存 `perf report --stdio` 和 `perf script` 文本，便于无原环境时审查。
-- 静态报告需记录查询命令、命中源码、BUILD 依赖、符号证据和可信度等级。
+- `linked-libraries.txt`：`ldd`、链接参数、include 和构建依赖证据。
+- `perf.data`/`perf-report.txt`：动态热点原始数据、build-id、采样命令和 Workload。
+- `math-candidates.json`：候选类型、函数名、源码位置、动态占比、静态命中、KML 子库和覆盖状态。
 
 ---
 
-### 组件三：优化方案与构建集成
+### 组件三：KML 替换方案与构建集成
 
 #### 3.1 组件功能整体流程
 
@@ -332,33 +329,34 @@ objdump -dC bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_server | \
 skinparam defaultFontName "Microsoft YaHei"
 skinparam defaultFontSize 10
 start
-:输入已确认的 GEMM 调用点与候选库;
-:映射数据类型、布局、转置和 leading dimension;
-:设计新后端与原实现运行时分支;
-:定位 Bazel external contraction 头文件;
-if (已完成 KML patch?) then (是)
-  :跳过重复修改;
-else (否)
-  :备份头文件;
-  :注入 cblas_sgemm 声明与 Eigen fallback;
-  :替换 FP32 dnnl_sgemm 调用点;
+:输入数学候选清单和平台能力结果;
+:按候选类型选择 KBLAS/KSVML/KFFT/KLAPACK;
+:核对 KML 是否覆盖函数、精度和数据类型;
+if (候选可等价替换?) then (否)
+  :记录不替换原因与替代建议;
+else (是)
+  :映射参数、布局、线程和错误语义;
+  :设计 KML 路径与原实现回退;
+  :修改调用点和构建链接配置;
+  :使用所选 SVE/NEON KML 库重新构建;
+  :验证 KML 符号、动态库和运行日志;
 endif
-:更新 .bazelrc 的编译宏、-L、-lkblas 和 rpath;
-:重新构建 server/client;
-:使用 nm 和 ldd 验证链接结果;
+:输出替换补丁、构建结果与风险清单;
 stop
 @enduml
 ```
 
 **通用流程说明**：
 
-1. 替换前必须建立旧 API 到新 API 的参数映射，特别是 row-major/column-major、M/N/K、transpose、lda/ldb/ldc 和 alpha/beta。
-2. 优化实现必须保留原后端回退，以便正确性对照、性能回归和不适用 shape 的动态选择。
-3. 编译成功不代表替换生效；必须同时验证目标符号、动态库解析和运行日志。
+1. **子库选择**：根据热点分类选择 KBLAS、KSVML、KFFT 或 KLAPACK，不允许把所有数学函数统一按 GEMM 处理。
+2. **能力核对**：检查 KML 版本是否提供目标函数、精度、复数/实数类型、批处理形式和线程模型；无等价接口时保留原实现。
+3. **语义映射**：矩阵类操作重点核对布局、M/N/K、转置和 leading dimension；向量数学重点核对精度和特殊值；FFT 重点核对 plan、方向和归一化；LAPACK 重点核对存储、workspace 和返回码。
+4. **回退设计**：优化实现必须保留原后端，用于数值对照、性能回归和不适用输入的动态选择。
+5. **生效验证**：编译成功不代表替换生效；必须同时验证 KML 目标符号、动态库解析和运行日志。
 
 **案例落地：将 Eigen contraction 替换为 KML**：
 
-通用流程中的“语义映射、接入候选库、保留回退、验证生效”，在本案例中实现为：
+TensorFlow Serving 在热点分析中被归类为 KBLAS 候选，随后按上述通用步骤实现为：
 
 1. `setup_kblas.sh` 自动发现 KML 库，补充缺失的 `tf_serving_vendored`，并更新目标工作树 `.bazelrc` 中 `kml_kblas` 的链接路径。
 2. `apply_kblas_patch.sh` 通过 `bazel info output_base` 找到 `eigen_contraction_kernel.h`，不修改 WORKSPACE，避免 TensorFlow external 仓库重新 fetch。
@@ -387,9 +385,9 @@ export LD_LIBRARY_PATH="$KML_LIB:${LD_LIBRARY_PATH:-}"
 
 #### 3.3 存储数据设计及描述
 
-- 首次 patch 前保留 `eigen_contraction_kernel.h.bak_dnnl`。
-- `.bazelrc` 保存 KML 编译宏、OpenMP、aarch64 优化和链接参数。
-- 构建日志必须保留 patch 结果、Bazel target、完整 flags、`nm` 与 `ldd` 输出。
+- `replacement-plan.json`：候选到 KML 子库/API 的映射、可替换性、参数语义和回退条件。
+- `changes.patch`：目标仓源码和构建配置变更；TensorFlow Serving 案例另保留 `eigen_contraction_kernel.h.bak_dnnl`。
+- `build-verification.txt`：完整构建命令、SVE/NEON 库选择、目标符号、`ldd` 和运行日志。
 
 ---
 
@@ -403,16 +401,16 @@ skinparam defaultFontName "Microsoft YaHei"
 skinparam defaultFontSize 10
 start
 :以同一输入分别执行原后端和优化后端;
-:检查输出 shape、数值误差和错误处理;
+:检查输出结构、数值误差和错误处理;
 if (正确性通过?) then (否)
-  :停止性能测试并检查布局/转置/leading dimension;
+  :停止性能测试并检查接口语义映射;
   stop
 endif
 :固定环境并执行 warmup;
-:对每个 shape 采集多轮延迟;
-:计算 avg/P50/P99/GFLOPS;
-:检查后端日志、符号和进程存活;
-:分析大矩阵收益、小矩阵退化和异常 shape;
+:对每组业务参数采集多轮延迟;
+:计算延迟、吞吐和操作特定指标;
+:检查 KML 日志、符号和进程存活;
+:分析获益范围、退化范围和异常输入;
 :形成适用范围与回退策略;
 stop
 @enduml
@@ -420,10 +418,11 @@ stop
 
 **通用流程说明**：
 
-1. **正确性先行**：使用确定性输入对比参考实现和优化实现，覆盖非方阵、转置、边界尺寸、非法参数和数值容差。
-2. **公平测量**：两后端必须使用相同进程入口、CPU/NUMA、线程、shape、warmup 和 iters；性能测试期间避免并行运行互相争抢 CPU 的实例。
-3. **分 shape 决策**：库替换不应假定全尺寸获益。大矩阵、小矩阵和特殊长宽比分别统计，并为退化范围保留 Eigen。
-4. **双重证据**：结果表之外还要保存启动日志和符号证据，证明数据来自实际 KBLAS/Eigen 后端。
+1. **正确性先行**：使用确定性输入对比参考实现和 KML 实现，覆盖典型参数、边界值、非法参数、特殊浮点值和项目要求的数值容差。
+2. **公平测量**：两种实现必须使用相同程序入口、CPU/NUMA、线程、业务参数、warmup 和 iters；性能测试期间避免同时运行导致资源争抢。
+3. **分参数决策**：数学库替换不应假定所有输入均获益，应分别统计典型规模和边界输入，并为退化范围保留原实现。
+4. **指标适配**：所有候选均统计 avg/P50/P99 和吞吐；KBLAS 可增加 GFLOPS，KFFT 可增加变换/秒，其他子库使用与业务操作匹配的指标。
+5. **双重证据**：结果表之外还要保存日志和符号证据，证明测试实际进入了选定的 KML 子库。
 
 **案例落地：通过 GEMM gRPC 服务完成对照验收**：
 
@@ -463,41 +462,42 @@ bash scripts/compare_backends.sh compute \
 
 ## 4. 开发者测试
 
-### 4.1 资源与基线测试
+### 4.1 平台能力与资源测试
 
 ```bash
 git -C "$REPO" rev-parse HEAD
+uname -m
+lscpu | rg -i 'sve|neon'
 sha256sum /tmp/boostkit-kml-1.7.0-1.aarch64.rpm
 rpm -qp --queryformat '%{NAME} %{VERSION}-%{RELEASE} %{ARCH}\n' \
   /tmp/boostkit-kml-1.7.0-1.aarch64.rpm
 "$BAZEL" --version
 ```
 
-**验收**：TF Serving commit、KML RPM 校验值和架构、Bazel/GCC 版本、CPU/OS、workload 参数均进入记录；先得到未 patch 的 Eigen 基线。
+**验收**：目标仓 commit、KML 制品校验值、aarch64 架构、SVE/NEON 决策、编译器和 CPU/OS 均进入记录；所选 KML 库目录与 CPU 能力一致。TensorFlow Serving 案例额外记录 Bazel、`DISTDIR` 和原始 Eigen 基线。
 
-### 4.2 动态热点定位测试
-
-```bash
-PID=$(pgrep -n gemm_server)
-perf stat -p "$PID" -e cycles,instructions,cache-references,cache-misses \
-  -- sleep 30
-perf record -F 99 -g --call-graph dwarf -p "$PID" -- sleep 60
-perf report --stdio --children --sort=dso,symbol > perf-report.txt
-```
-
-**验收**：采样期间持续发送固定 workload；报告能够识别 GEMM 或其上层 MatMul/contraction 热点。若只有 `[unknown]`、gRPC 或调度线程，先排查权限、符号、回溯格式、采样窗口和负载，再决定是否进入静态兜底。
-
-### 4.3 静态识别兜底测试
+### 4.2 数学库依赖与动态热点测试
 
 ```bash
-OUTPUT_BASE=$("$BAZEL" info output_base)
-rg -n 'MatMul|Tensor::contract|ParallelMatMulKernel|dnnl_sgemm' \
-  deployment "$OUTPUT_BASE/external/org_tensorflow"
-nm -C bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_server | \
-  rg 'MatMul|contract|ParallelMatMulKernel|sgemm'
+ldd <target_binary> | \
+  rg -i 'blas|sleef|fftw|lapack|libm|openblas|atlas|mkl|vec'
+perf record -F 99 -g -p <pid> -o /tmp/perf.data -- sleep 60
+perf report -i /tmp/perf.data --stdio --no-children > perf-report.txt
 ```
 
-**验收**：同时给出 Graph MatMul、BUILD CPU OpKernel 依赖和 external TF contraction/ELF 符号三层证据；结果明确标注“静态识别，待动态验证”。
+**验收**：输出当前数学库依赖；采样期间持续运行固定 Workload；热点按 KBLAS、KSVML、KFFT、KLAPACK 候选分类。`perf` 不可用时记录原因，但仍继续执行静态扫描。
+
+### 4.3 源码静态扫描测试
+
+```bash
+rg -n -g '*.{c,cc,cpp,h,hpp}' \
+  'cblas_|[sd]gemm_|Sleef_|fftw_|LAPACKE_|expf?|logf?|sinf?|cosf?' \
+  <src_dir>
+rg -n 'find_package.*(BLAS|FFTW|LAPACK|SLEEF)|-l(blas|openblas|fftw|lapack|sleef)' \
+  <src_dir> <build_dir>
+```
+
+**验收**：无论 `perf` 是否成功都执行静态扫描；报告包含源码调用、include、链接参数和构建依赖，并过滤测试、示例、vendor 和生成文件。仅静态命中的候选标记为“未被当前 Workload 动态覆盖”。
 
 ### 4.4 Patch 幂等与链接测试
 

@@ -4,12 +4,12 @@
 
 ### 1.1 目的
 
-本文给出一套可复用的 CPU 矩阵乘优化流程，并以本仓库的 TensorFlow Serving FP32 MatMul 为具体落地对象。主流程遵循“确定对象、建立基线、定位热点、选择方案、实现替换、验证收益”的通用性能优化方法；每个阶段再穿插 TensorFlow Serving、Eigen contraction、鲲鹏 KML 和 Bazel 的专有处理。
+本文给出一套可复用的 CPU 矩阵乘内核替换流程，主线遵循“确定对象、建立基线、定位热点、选择方案、实现替换、验证收益”的通用性能优化方法。TensorFlow Serving FP32 MatMul 替换为鲲鹏 KML 不是另一套并列流程，而是贯穿各阶段的实践案例：文档先说明该阶段对任意 GEMM 调用方的要求，再说明本仓库如何在案例中落实这些要求。
 
 本期目标如下：
 
 1. **流程通用化**：热点定位和内核替换方法不依赖某个固定框架，可复用于其他 GEMM 调用方。
-2. **TF Serving 落地**：保持 gRPC、TensorFlow Graph、`ClientSession::Run`、MatMul OpKernel 和 Eigen contraction 上层路径不变，仅替换末级 FP32 SGEMM。
+2. **案例可落地**：以 TensorFlow Serving 为例，保持 gRPC、TensorFlow Graph、`ClientSession::Run`、MatMul OpKernel 和 Eigen contraction 上层路径不变，仅替换末级 FP32 SGEMM。
 3. **结果可归因**：优化前后使用相同 binary 入口、输入 shape、线程配置和统计口径，避免把网络、Graph 构建或输入生成差异误判为内核收益。
 4. **过程可复现**：记录源码版本、KML 制品、构建参数、动态调用栈、静态证据和基线数据，支持回归与审计。
 
@@ -18,13 +18,13 @@
 | 字段 | 内容 |
 | --- | --- |
 | 通用优化对象 | CPU 上占用显著的 FP32 GEMM/MatMul 调用 |
-| 本仓库落地对象 | TensorFlow Serving 2.17.0 的 Eigen contraction 路径 |
+| 实践案例 | TensorFlow Serving 2.17.0 的 Eigen contraction 路径替换为 KML |
 | 目标平台 | 鲲鹏 aarch64 / openEuler 20.03 LTS SP3 及以上 |
 | 优化库 | boostkit-kml 1.7.0+，运行时依赖 `libkblas.so` |
 | 构建环境 | Bazel 7.4.1、GCC 12.3.1+、C++17 |
 | 功能分解 | 分析对象准备、热点识别、优化方案与集成、正确性验证、性能验收 |
 
-通用 GEMM 优化不能从“替换一个函数名”直接开始。首先要证明目标负载确实消耗在矩阵乘内核，然后确认矩阵数据类型、布局、转置语义和尺寸分布，最后才能选择适合的高性能库。对于 TensorFlow Serving，还要额外处理 Graph 到 OpKernel 的间接调用、Eigen 模板内联、Bazel external cache、动态库链接和同路径后端切换问题。
+通用 GEMM 优化不能从“替换一个函数名”直接开始。首先要证明目标负载确实消耗在矩阵乘内核，然后确认矩阵数据类型、布局、转置语义和尺寸分布，最后才能选择适合的高性能库。本仓库以 TensorFlow Serving 为案例，把 Graph 到 OpKernel 的间接调用、Eigen 模板内联、Bazel external cache、动态库链接和同路径后端切换分别映射到上述通用步骤中。
 
 ---
 
@@ -32,7 +32,7 @@
 
 ### 2.1 架构整体设计
 
-整体过程以通用性能优化闭环为主线，TensorFlow Serving 的专有步骤只作为各阶段的具体实现：
+整体过程以通用性能优化闭环为主线，TensorFlow Serving/KML 案例在相应阶段给出具体实现和验证证据：
 
 ```plantuml
 @startuml
@@ -49,7 +49,7 @@ start
 partition "阶段一：对象与基线" {
   :准备源码、工具链和候选优化库;
   :定义业务 workload、统计指标和正确性标准;
-  #EEEDFE:TF Serving：准备 MatMul gRPC 服务、Eigen 基线和 KML RPM;
+  #EEEDFE:案例：准备 TF Serving MatMul 服务、Eigen 基线和 KML RPM;
 }
 
 partition "阶段二：热点识别" {
@@ -60,14 +60,14 @@ partition "阶段二：热点识别" {
     :用源码、构建依赖和 ELF 符号静态识别;
     :将结论标记为待动态验证;
   endif
-  #EEEDFE:TF Serving：确认 MatMul -> Tensor::contract -> ParallelMatMulKernel;
+  #EEEDFE:案例：确认 MatMul -> Tensor::contract -> ParallelMatMulKernel;
 }
 
 partition "阶段三：方案与实现" {
   :校验布局、转置、leading dimension 和线程模型;
   :接入候选库并保留原实现回退;
-  #EEEDFE:TF Serving：在 Bazel cache 中 patch contraction 头文件;
-  #EEEDFE:TF Serving：cblas_sgemm / Eigen fallback 运行时二选一;
+  #EEEDFE:案例：在 Bazel cache 中 patch contraction 头文件;
+  #EEEDFE:案例：cblas_sgemm / Eigen fallback 运行时二选一;
 }
 
 partition "阶段四：验证与验收" {
@@ -101,7 +101,7 @@ package "分析与决策层（通用）" {
   component "替换决策" as Decision
 }
 
-package "优化集成层（TF Serving 专有）" {
+package "案例实现层（TF Serving + KML）" {
   component "setup_kblas.sh" as Setup
   component "apply_kblas_patch.sh" as Patch
   artifact "eigen_contraction_kernel.h" as Header
@@ -159,12 +159,14 @@ stop
 3. **运行条件**：记录 CPU 型号、NUMA、频率策略、CPU affinity、线程数和系统负载。优化前后仅允许改变被比较的 GEMM 后端。
 4. **统计口径**：同时保留 avg、P50、P99 和 GFLOPS；GFLOPS 按 `2*M*K*N / seconds / 1e9` 计算。
 
-**TensorFlow Serving 专有步骤**：
+**案例落地：TensorFlow Serving 使用 KML**：
+
+通用流程中的“准备对象、固定 Workload、生成原始基线”，在本案例中对应以下操作：
 
 1. 使用与目标环境一致的 TF Serving 2.17.0 工作树，并优先复用已经成功构建的 Bazel `output_base` 与 `DISTDIR`。
 2. 将 `deployment/tf_serving_gemm` 作为 Bazel package 集成到目标工作树。server 构造动态形状 Placeholder 和 `MatMul` 图，client 通过 gRPC 执行单次 Compute 或方阵 Sweep。
 3. 在应用 KML patch 之前先生成 Eigen 基线。Graph 和 `ClientSession` 在进程内复用，避免每次请求重建图。
-4. KML 使用 aarch64 RPM；无 root 环境通过 `rpm2cpio` 解包到 TF Serving 的 `third_party/kml`，避免 Bazel execution root 拒绝外部 include 路径。
+4. 将 KML aarch64 RPM 作为本案例的候选实现；无 root 环境通过 `rpm2cpio` 解包到 TF Serving 的 `third_party/kml`，避免 Bazel execution root 拒绝外部 include 路径。
 
 #### 3.2 接口设计
 
@@ -228,9 +230,11 @@ stop
 3. **静态分析边界**：静态分析只能证明代码和链接路径存在，不能证明生产请求一定执行该路径，因此静态结果必须保留限制说明。
 4. **替换决策**：除热点比例外，还要核对候选库是否支持数据类型、矩阵布局、转置、leading dimension、线程模型和典型 shape。
 
-**TensorFlow Serving 专有步骤**：
+**案例落地：在 TensorFlow Serving 中确认替换点**：
 
-1. 动态调用链期望从 TensorFlow executor/MatMul OpKernel 展开到 `Eigen::Tensor::contract`、`ParallelMatMulKernel` 或 SGEMM 相关符号；Eigen 模板大量内联时允许从邻近符号和源码位置组合判断。
+通用流程要求从业务入口确认到 GEMM 内核的完整证据链。本案例将这条证据链具体映射为：
+
+1. 动态调用链从 TensorFlow executor/MatMul OpKernel 展开到 `Eigen::Tensor::contract`、`ParallelMatMulKernel` 或 SGEMM 相关符号；Eigen 模板大量内联时允许从邻近符号和源码位置组合判断。
 2. 静态兜底从 `server.cc` 的 `tfops::MatMul` 开始，检查 BUILD 中 `//tensorflow/cc:cc_ops`、`//tensorflow/core:core_cpu` 等依赖，再进入 Bazel `output_base/external/org_tensorflow` 查找 contraction 实现。
 3. 本期候选替换点限定为 FP32 contraction SGEMM。int8 路径和非 MatMul 热点不纳入 KBLAS 性能结论。
 
@@ -306,7 +310,9 @@ stop
 2. 优化实现必须保留原后端回退，以便正确性对照、性能回归和不适用 shape 的动态选择。
 3. 编译成功不代表替换生效；必须同时验证目标符号、动态库解析和运行日志。
 
-**TensorFlow Serving 专有步骤**：
+**案例落地：将 Eigen contraction 替换为 KML**：
+
+通用流程中的“语义映射、接入候选库、保留回退、验证生效”，在本案例中实现为：
 
 1. `setup_kblas.sh` 自动发现 KML 库，补充缺失的 `tf_serving_vendored`，并更新目标工作树 `.bazelrc` 中 `kml_kblas` 的链接路径。
 2. `apply_kblas_patch.sh` 通过 `bazel info output_base` 找到 `eigen_contraction_kernel.h`，不修改 WORKSPACE，避免 TensorFlow external 仓库重新 fetch。
@@ -373,7 +379,9 @@ stop
 3. **分 shape 决策**：库替换不应假定全尺寸获益。大矩阵、小矩阵和特殊长宽比分别统计，并为退化范围保留 Eigen。
 4. **双重证据**：结果表之外还要保存启动日志和符号证据，证明数据来自实际 KBLAS/Eigen 后端。
 
-**TensorFlow Serving 专有步骤**：
+**案例落地：通过 GEMM gRPC 服务完成对照验收**：
+
+通用流程要求先验证输出，再在相同条件下比较原实现和候选实现。本案例通过仓库中的 GEMM 服务完成这两个步骤：
 
 1. `GEMMRunner` 创建一次动态形状 Graph 和 `ClientSession`；`Run()` 用 mutex 保护 Session，计时范围覆盖 `ClientSession::Run`。
 2. Compute RPC 接收 row-major A、B 和 M/K/N，校验输入元素数，返回 C 及 `server_compute_ms`；Sweep RPC 在服务端生成固定种子矩阵，减少网络传输对纯内核计时的影响。

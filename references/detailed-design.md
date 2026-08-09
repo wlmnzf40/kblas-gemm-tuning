@@ -1,30 +1,43 @@
-# 矩阵乘内核优化详设文档——TensorFlow Serving KML 替换实践
+# 数学库鲲鹏亲和优化详设文档——TensorFlow Serving KML 替换案例
 
 ## 1. 设计背景
 
 ### 1.1 目的
 
-本文给出一套可复用的 CPU 矩阵乘内核替换流程，主线遵循“确定对象、建立基线、定位热点、选择方案、实现替换、验证收益”的通用性能优化方法。TensorFlow Serving FP32 MatMul 替换为鲲鹏 KML 不是另一套并列流程，而是贯穿各阶段的实践案例：文档先说明该阶段对任意 GEMM 调用方的要求，再说明本仓库如何在案例中落实这些要求。
+KML 是面向鲲鹏处理器优化的高性能数学库。目标软件即使已经调用 BLAS、Eigen、oneDNN 等数学库或框架内核，也不代表这些实现能够充分发挥鲲鹏处理器的指令、缓存和多核能力。因此，本 Skill 面向一个给定的软件源码仓，识别其中实际使用的数学计算及其底层库函数，评估是否存在可由 KML 承接的热点，并在接口语义和数值正确性满足要求时，将原实现替换为鲲鹏亲和的 KML 实现。
+
+本设计不把“发现函数名后直接替换”作为目标，而是形成“仓库扫描与调用识别、动态热点确认、静态分析兜底、KML 接口匹配、构建集成、正确性验证、性能验收”的完整闭环。通过该闭环，使目标软件的数学计算路径更适合鲲鹏平台，同时保留原实现作为对照和回退。
+
+本 Skill 支持两种使用方式：
+
+1. **独立使用**：用户直接提供目标软件仓、构建环境和代表性 Workload，由本 Skill 完成分析、替换指导、构建验证与性能对比。
+2. **被其他 Skill 调用**：上层的源码迁移、鲲鹏亲和分析或整库性能优化 Skill 可以把目标仓信息和 Workload 传入本 Skill，并消费本 Skill 输出的热点证据、替换方案、补丁、构建结果和性能报告。
+
+TensorFlow Serving FP32 MatMul 替换为 KML `cblas_sgemm` 是本文的贯穿案例，用于说明上述通用流程如何落到真实仓库；它不是本 Skill 唯一可分析的数学计算场景。
 
 本期目标如下：
 
-1. **流程通用化**：热点定位和内核替换方法不依赖某个固定框架，可复用于其他 GEMM 调用方。
-2. **案例可落地**：以 TensorFlow Serving 为例，保持 gRPC、TensorFlow Graph、`ClientSession::Run`、MatMul OpKernel 和 Eigen contraction 上层路径不变，仅替换末级 FP32 SGEMM。
-3. **结果可归因**：优化前后使用相同 binary 入口、输入 shape、线程配置和统计口径，避免把网络、Graph 构建或输入生成差异误判为内核收益。
-4. **过程可复现**：记录源码版本、KML 制品、构建参数、动态调用栈、静态证据和基线数据，支持回归与审计。
+1. **数学操作识别**：在目标仓中识别数学库依赖、函数调用和框架间接调用，并结合运行时热点判断是否值得替换。
+2. **KML 亲和替换**：对 KML 能力范围内的数据类型和操作完成接口语义映射、构建接入和回退设计。
+3. **结果可归因**：优化前后使用相同程序入口、Workload、线程配置和统计口径，确保收益来自数学内核替换。
+4. **过程可复现**：记录源码版本、KML 制品、构建参数、热点证据和基线数据，支持回归与审计。
+5. **能力可组合**：定义清晰的输入、输出和阶段性产物，使本 Skill 既能独立执行，也能作为其他 Skill 的数学库优化子流程。
 
 ### 1.2 需求背景
 
 | 字段 | 内容 |
 | --- | --- |
-| 通用优化对象 | CPU 上占用显著的 FP32 GEMM/MatMul 调用 |
+| Skill 输入 | 目标软件源码仓、目标鲲鹏环境、构建方式、代表性 Workload |
+| 通用优化对象 | 目标仓中的数学库调用、框架数学内核及其运行时热点 |
 | 实践案例 | TensorFlow Serving 2.17.0 的 Eigen contraction 路径替换为 KML |
 | 目标平台 | 鲲鹏 aarch64 / openEuler 20.03 LTS SP3 及以上 |
 | 优化库 | boostkit-kml 1.7.0+，运行时依赖 `libkblas.so` |
 | 构建环境 | Bazel 7.4.1、GCC 12.3.1+、C++17 |
-| 功能分解 | 分析对象准备、热点识别、优化方案与集成、正确性验证、性能验收 |
+| Skill 输出 | 数学操作清单、热点证据、KML 可替换性结论、补丁/配置、验证与性能报告 |
+| 调用方式 | 独立使用，或由源码迁移/亲和分析/性能优化类 Skill 调用 |
+| 功能分解 | 目标仓分析、热点识别、KML 适配与集成、正确性验证、性能验收 |
 
-通用 GEMM 优化不能从“替换一个函数名”直接开始。首先要证明目标负载确实消耗在矩阵乘内核，然后确认矩阵数据类型、布局、转置语义和尺寸分布，最后才能选择适合的高性能库。本仓库以 TensorFlow Serving 为案例，把 Graph 到 OpKernel 的间接调用、Eigen 模板内联、Bazel external cache、动态库链接和同路径后端切换分别映射到上述通用步骤中。
+数学库亲和优化不能从“替换一个函数名”直接开始。首先要识别目标仓使用了哪些显式或间接的数学操作，再证明代表性负载确实消耗在这些操作上，随后确认数据类型、布局、维度、转置语义、线程模型和数值要求，最后才能判断是否适合替换为 KML。本仓库以 TensorFlow Serving 为案例，把 Graph 到 OpKernel 的间接调用、Eigen 模板内联、Bazel external cache、动态库链接和同路径后端切换分别映射到上述通用步骤中。
 
 ---
 
@@ -32,7 +45,7 @@
 
 ### 2.1 架构整体设计
 
-整体过程以通用性能优化闭环为主线，TensorFlow Serving/KML 案例在相应阶段给出具体实现和验证证据：
+整体过程接收目标仓、构建环境和 Workload 作为统一输入。输入既可以由用户直接提供，也可以由上层 Skill 传入；后续均进入同一套数学操作识别与 KML 替换闭环。TensorFlow Serving/KML 案例在相应阶段给出具体实现和验证证据：
 
 ```plantuml
 @startuml
@@ -45,9 +58,16 @@ skinparam DiamondBackgroundColor #FAEEDA
 skinparam DiamondBorderColor #854F0B
 
 start
+:接收目标仓、构建环境与代表性 Workload;
+if (调用来源?) then (独立使用)
+  :解析用户提供的参数;
+else (上层 Skill)
+  :接收标准化任务上下文;
+endif
 
 partition "阶段一：对象与基线" {
-  :准备源码、工具链和候选优化库;
+  :扫描数学库依赖、显式函数和框架数学操作;
+  :准备工具链、原始实现和 KML 候选实现;
   :定义业务 workload、统计指标和正确性标准;
   #EEEDFE:案例：准备 TF Serving MatMul 服务、Eigen 基线和 KML RPM;
 }
@@ -55,7 +75,7 @@ partition "阶段一：对象与基线" {
 partition "阶段二：热点识别" {
   :以稳定负载进行动态采样;
   if (能得到可信调用栈?) then (是)
-    :确认 GEMM 热点、数据类型和 shape;
+    :确认数学热点、数据类型和参数特征;
   else (否)
     :用源码、构建依赖和 ELF 符号静态识别;
     :将结论标记为待动态验证;
@@ -64,8 +84,8 @@ partition "阶段二：热点识别" {
 }
 
 partition "阶段三：方案与实现" {
-  :校验布局、转置、leading dimension 和线程模型;
-  :接入候选库并保留原实现回退;
+  :将原数学操作语义映射到 KML 接口;
+  :接入 KML 并保留原实现回退;
   #EEEDFE:案例：在 Bazel cache 中 patch contraction 头文件;
   #EEEDFE:案例：cblas_sgemm / Eigen fallback 运行时二选一;
 }
@@ -81,6 +101,7 @@ partition "阶段四：验证与验收" {
   endif
 }
 
+:输出操作清单、证据、补丁、构建结果和性能报告;
 stop
 @enduml
 ```
@@ -95,6 +116,7 @@ skinparam defaultFontName "Microsoft YaHei"
 skinparam classAttributeIconSize 0
 
 package "分析与决策层（通用）" {
+  component "目标仓数学操作扫描" as Scan
   component "Workload 与基线" as Baseline
   component "perf 动态分析" as Perf
   component "源码/BUILD/ELF 静态分析" as Static
@@ -114,6 +136,11 @@ package "验证层" {
   component "compare_backends.sh" as Compare
 }
 
+component "用户 / 上层 Skill" as Caller
+artifact "操作清单、补丁与验证报告" as Result
+
+Caller --> Scan : 目标仓 + 环境 + Workload
+Scan --> Baseline
 Baseline --> Perf
 Perf --> Decision : 动态证据
 Perf --> Static : 调用栈不可用
@@ -125,8 +152,12 @@ Header --> Kblas : cblas_sgemm
 Compare --> Server
 Compare --> Client
 Client --> Server : gRPC Compute/Sweep
+Decision --> Result
+Compare --> Result
 @enduml
 ```
+
+对外能力边界如下：独立模式负责引导用户补齐输入并执行完整流程；被调用模式不重复推断上层已经提供的信息，而是接收目标仓路径、平台信息、构建命令和 Workload，并以结构化阶段产物返回。两种模式使用相同的分析和验收标准，避免出现独立调用与组合调用结论不一致。
 
 ---
 
@@ -154,10 +185,11 @@ stop
 
 **通用流程说明**：
 
-1. **对象边界**：明确优化对象是 FP32 GEMM，而不是完整模型端到端推理。基线既要包含内核计算时间，也要区分客户端 RTT，防止网络序列化影响内核结论。
-2. **Workload 选择**：不能只使用单个方阵。至少覆盖小、中、大方阵和真实业务 M×K×N，并固定 warmup、iters、并发度和随机种子。
-3. **运行条件**：记录 CPU 型号、NUMA、频率策略、CPU affinity、线程数和系统负载。优化前后仅允许改变被比较的 GEMM 后端。
-4. **统计口径**：同时保留 avg、P50、P99 和 GFLOPS；GFLOPS 按 `2*M*K*N / seconds / 1e9` 计算。
+1. **目标仓扫描**：检查构建文件和源码中的数学库依赖、头文件、显式 API 调用以及框架级数学操作，形成候选操作清单。扫描结果只是候选集合，是否替换仍由运行时热点和 KML 接口匹配决定。
+2. **对象边界**：明确待优化的是目标仓中的数学计算路径，而不是默认把完整程序耗时归因到数学库。对服务程序还要区分内核计算时间和客户端 RTT。
+3. **Workload 选择**：选择能够代表真实业务的数据规模、参数组合和并发模式；对于 GEMM，不能只使用单个方阵，应覆盖典型 M×K×N。
+4. **运行条件**：记录 CPU 型号、NUMA、频率策略、CPU affinity、线程数和系统负载。优化前后仅允许改变被比较的数学内核实现。
+5. **统计口径**：通用指标包括 avg、P50、P99、吞吐和 CPU 资源；GEMM 案例额外使用 GFLOPS，并按 `2*M*K*N / seconds / 1e9` 计算。
 
 **案例落地：TensorFlow Serving 使用 KML**：
 
@@ -169,6 +201,20 @@ stop
 4. 将 KML aarch64 RPM 作为本案例的候选实现；无 root 环境通过 `rpm2cpio` 解包到 TF Serving 的 `third_party/kml`，避免 Bazel execution root 拒绝外部 include 路径。
 
 #### 3.2 接口设计
+
+**Skill 调用契约**：
+
+| 类型 | 字段 | 说明 |
+| --- | --- | --- |
+| 输入 | `repository` | 待分析的目标软件仓路径与源码版本 |
+| 输入 | `platform` | 鲲鹏 CPU、OS、编译器以及 KML 可用信息 |
+| 输入 | `build` | 原软件构建命令、依赖缓存和产物位置 |
+| 输入 | `workload` | 可重复执行的运行命令、输入规模、预热和采样要求 |
+| 输出 | `math_operations` | 发现的数学依赖、显式调用、框架间接调用及证据位置 |
+| 输出 | `replacement_plan` | KML 可替换性、接口语义映射、风险与回退条件 |
+| 输出 | `artifacts` | 补丁、构建配置、日志、符号检查和性能报告 |
+
+独立使用时由用户逐项提供或确认这些输入；被其他 Skill 调用时由调用方传递相同字段，并读取相同输出，不另设一套执行逻辑。
 
 ```bash
 git clone --branch 2.17.0 <TF_SERVING_GIT_URL> "$REPO"

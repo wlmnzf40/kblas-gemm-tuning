@@ -1,21 +1,28 @@
 ---
 name: kml-library-replacement
 description: >-
-  这是通用 KML（鲲鹏数学库）替换技能。给定一个目标 C/C++ 项目，自动判断其中哪些数学函数可以用
-  KML 库替换，选择正确的 KML 子库（KBLAS/KSVML/KFFT/KLAPACK 等），并指导大模型完成源码级或链接级的替换。
-  在用户提及 KML 替换、鲲鹏数学库加速、cblas_sgemm、SLEEF 替换、OpenBLAS 替换、向量数学函数加速、
-  KBLAS、KSVML、KFFT、"用 KML 加速这个项目"、"替换数学库" 等场景下触发。
-  适用于鲲鹏（aarch64）平台上、有源码或可重新链接的 C/C++ 项目。
+  这是通用 KML（鲲鹏数学库）自动替换技能。在鲲鹏（aarch64）平台上分析任何 C/C++ 项目时自动触发，
+  无需用户明确提及 KML 或数学库替换。自动完成：下载安装 KML、检测目标项目中的数学库依赖
+  （SLEEF/OpenBLAS/FFTW/Eigen/libm 等）、用 perf 或源码分析定位数学热点、选择正确的 KML 子库
+  （KBLAS/KSVML/KFFT/KLAPACK）、执行源码级或链接级替换、验证功能正确性和性能提升。
+  在鲲鹏 aarch64 平台上进行任何 C/C++ 源码性能优化、加速、热点分析时即应触发本技能。
   不适用于 x86 平台、纯二进制无法重链接的项目、以及非数学密集型项目。
 metadata:
   author: Kunpeng DevKit
-  version: "2.0.0"
+  version: "2.1.0"
 compatibility: 依赖鲲鹏 aarch64 / openEuler 22.03 LTS SP3 及以上，GCC 12.3.1+，KML 2.5.0+（boostkit-kml 或 kml rpm 包）
 ---
 
 ## 功能概述
 
-本 Skill 提供端到端的 KML 替换能力：从分析目标项目的数学函数热点，到选择正确的 KML 子库，再到实施源码级或链接级替换，最终验证功能正确性和性能提升。
+本 Skill 提供端到端、全自动的 KML 替换能力。**无需用户明确提及 KML 替换**，只要在鲲鹏 aarch64 平台上分析 C/C++ 项目性能，本技能即自动：
+
+1. 下载并安装 KML 库
+2. 检测目标项目链接的数学库（SLEEF/OpenBLAS/FFTW/Eigen/libm 等）
+3. 用 perf 或源码 grep 定位数学热点函数
+4. 选择正确的 KML 子库（KBLAS/KSVML/KFFT/KLAPACK）
+5. 执行源码级或链接级替换
+6. 验证功能正确性和性能提升
 
 **KML（Kunpeng Math Library）** 是华为为鲲鹏处理器优化的数学库套件，包含以下子库：
 
@@ -37,26 +44,61 @@ compatibility: 依赖鲲鹏 aarch64 / openEuler 22.03 LTS SP3 及以上，GCC 12
 
 ## 使用流程
 
-### Step 1 — 安装 KML
+### Step 1 — 下载并安装 KML
+
+#### 1.1 下载 KML rpm 包
 
 ```bash
-# 方式 A：rpm 安装（root 权限）
-rpm -ivh kml-2.5.0-1.aarch64.rpm
-# 库文件默认在 /usr/local/kml/lib/{neon,sve,noarch}/
+# 下载源 A：openEuler 官方源（推荐，SP3 对应版本）
+wget -O /tmp/kml-2.5.0-1.aarch64.rpm \
+  "https://repo.oepkgs.net/openeuler/rpm/openEuler-22.03-LTS-SP3/extras/aarch64/Packages/k/kml-2.5.0-1.aarch64.rpm"
 
-# 方式 B：解压到项目内（无 root 权限，推荐用于 Bazel 等沙箱构建）
-mkdir -p third_party/kml
-rpm2cpio kml-2.5.0-1.aarch64.rpm | cpio -idmv --no-absolute-filenames -D third_party/kml
-# 库文件在 third_party/kml/usr/local/kml/lib/{neon,sve,noarch}/
+# 下载源 B：boostkit-kml（旧版 1.7.0，兼容 openEuler 20.03 SP3）
+wget -O /tmp/boostkit-kml-1.7.0-1.aarch64.rpm \
+  "https://repo.oepkgs.net/openeuler/rpm/openEuler-20.03-LTS-SP3/extras/aarch64/Packages/b/boostkit-kml-1.7.0-1.aarch64.rpm"
+
+# 下载源 C：鲲鹏 DevKit 官网（如以上源不可用，从官网获取最新下载地址）
+# https://www.hikunpeng.com/zh/developer/devkit
+
+# 也可直接用 yum 安装（如仓库已配置）
+yum install -y kml 2>/dev/null || yum install -y boostkit-kml 2>/dev/null
 ```
 
-验证安装：
+> **注意：** `kml-2.5.0` 和 `boostkit-kml-1.7.0` 的库目录结构略有不同。2.5.0 版将 KSVML 分为 `neon/` 和 `sve/` 子目录；1.7.0 版可能需要手动查找。以下步骤以 2.5.0 为准。
+
+#### 1.2 安装 KML
+
 ```bash
+# 方式 A：rpm 安装（root 权限，推荐）
+rpm -ivh /tmp/kml-2.5.0-1.aarch64.rpm
+# 库文件默认在 /usr/local/kml/lib/{neon,sve,noarch}/
+# 头文件在 /usr/local/kml/include/
+
+# 方式 B：解压到项目内（无 root 权限，或 Bazel 等沙箱构建需要库在 execroot 内）
+mkdir -p third_party/kml
+rpm2cpio /tmp/kml-2.5.0-1.aarch64.rpm | cpio -idmv --no-absolute-filenames -D third_party/kml
+# 库文件在 third_party/kml/usr/local/kml/lib/{neon,sve,noarch}/
+
+# 方式 C：yum 直接安装（如官方源可用）
+yum install -y kml
+```
+
+#### 1.3 验证安装
+
+```bash
+# 确认库文件存在
 ls /usr/local/kml/lib/neon/libksvml.so    # KSVML（NEON 版）
 ls /usr/local/kml/lib/sve/libksvml.so     # KSVML（SVE 版）
-ls /usr/local/kml/lib/noarch/libkm.so     # KM
+ls /usr/local/kml/lib/noarch/libkm.so     # KM（基础数学）
 ls /usr/local/kml/lib/neon/libkblas.so    # KBLAS（NEON 版）
+ls /usr/local/kml/lib/noarch/libkblas.so  # KBLAS（可能在 noarch 或 neon 下）
+ls /usr/local/kml/lib/neon/libkfft.so     # KFFT
+ls /usr/local/kml/lib/neon/libklapack.so  # KLAPACK
+
+# 确认头文件存在
 ls /usr/local/kml/include/ksvml.h         # KSVML 头文件
+ls /usr/local/kml/include/km.h            # KM 头文件
+ls /usr/local/kml/include/kfft.h          # KFFT 头文件
 ```
 
 ### Step 2 — 分析目标项目的数学函数热点
@@ -89,13 +131,21 @@ grep -r '\-l.*blas\|\-l.*sleef\|\-l.*fftw\|\-l.*lapack\|\-l.*m[^a-z]' <build_dir
 grep -rn '#include.*blas\|#include.*sleef\|#include.*fftw\|#include.*lapack\|#include.*m\.h' <src_dir>/
 ```
 
-#### 2.3 用 perf 找到数学热点函数
+#### 2.3 定位数学热点函数
+
+**方案 A（首选）：perf 动态采集**
+
+如果系统有 perf，优先使用 perf 采集运行时热点，精确度最高。
 
 ```bash
-# 采集热点（60 秒）
-perf record -F 99 -g -p <pid> -o /tmp/perf.data -- sleep 60
-# 查看热点函数 Top 20
-perf report -i /tmp/perf.data --stdio --no-children | grep -E '^\s+[0-9]' | head -20
+# 尝试安装 perf
+which perf 2>/dev/null || yum install -y perf 2>/dev/null
+
+# 如果 perf 可用，采集热点（60 秒）
+if which perf >/dev/null 2>&1; then
+    perf record -F 99 -g -p <pid> -o /tmp/perf.data -- sleep 60
+    perf report -i /tmp/perf.data --stdio --no-children | grep -E '^\s+[0-9]' | head -20
+fi
 ```
 
 **判断标准：**
@@ -103,6 +153,37 @@ perf report -i /tmp/perf.data --stdio --no-children | grep -E '^\s+[0-9]' | head
 - 热点函数名含 `exp`/`log`/`sin`/`cos`/`tan`/`pow`/`sqrt` → **KSVML 替换候选**
 - 热点函数名含 `fft`/`dft`/`rfft`/`cfft` → **KFFT 替换候选**
 - 热点函数名含 `solve`/`factorize`/`inverse`/`ev`/`svd`/`qr` → **KLAPACK 替换候选**
+
+**方案 B（回退）：源码静态分析**
+
+如果 perf 无法安装（无 root 权限、内核版本不匹配、容器环境等），通过源码 grep 直接定位数学函数调用点。此方案不需要运行程序，适合项目尚未编译或无法运行的情况。
+
+```bash
+# 1. 搜索 BLAS 调用（KBLAS 替换候选）
+grep -rn 'cblas_sgemm\|cblas_dgemm\|cblas_sgemv\|cblas_dgemv\|sgemm_\|dgemm_' <src_dir>/ --include='*.cpp' --include='*.cc' --include='*.c' --include='*.h'
+grep -rn 'Eigen::Matrix.*\*.*Matrix\|\.noalias()\|\.transpose()' <src_dir>/ --include='*.cpp'  # Eigen GEMM
+grep -rn 'cublasSgemm\|cublasDgemm' <src_dir>/ --include='*.cu'  # CUDA BLAS（如适用）
+
+# 2. 搜索向量数学函数调用（KSVML 替换候选）
+grep -rn 'Sleef_\|sleef\|_expf\|_logf\|_sinf\|_cosf\|expf\|logf\|log10f\|sinf\|cosf\|powf\|sqrtf\|tanhf' <src_dir>/ --include='*.cpp' --include='*.c'
+grep -rn 'Sleef_expd2\|Sleef_log10d2\|Sleef_sind2\|Sleef_cisd2' <src_dir>/  # SLEEF 向量化
+grep -rn '__exp\|__log\|_mm_exp\|_mm256_exp\|ivml_exp\|vdExp\|vdLog' <src_dir>/  # 其他数学库
+
+# 3. 搜索 FFT 调用（KFFT 替换候选）
+grep -rn 'fftw_\|FFTW_\|cufft\|DftiCompute\|ne10_fft\|kiss_fft' <src_dir>/ --include='*.cpp' --include='*.c'
+
+# 4. 搜索 LAPACK 调用（KLAPACK 替换候选）
+grep -rn 'LAPACKE_\|lapacke_\|dgesv_\|sgesv_\|dpotrf_\|spotrf_\|dsyev_\|ssyev_' <src_dir>/ --include='*.cpp' --include='*.c'
+
+# 5. 搜索 include 依赖
+grep -rn '#include.*sleef\|#include.*fftw\|#include.*blas\|#include.*lapack\|#include.*mkl\|#include.*cblas' <src_dir>/ --include='*.h' --include='*.cpp'
+
+# 6. 搜索链接参数
+grep -rn '\-lSLEEF\|\-lsleef\|\-lblas\|\-lopenblas\|\-latlas\|\-lmkl\|\-lfftw\|\-llapack' <build_dir>/ 2>/dev/null
+grep -rn 'find_package.*BLAS\|find_package.*FFTW\|find_package.*LAPACK\|find_package.*SLEEF' <src_dir>/ 2>/dev/null
+```
+
+> **自动决策：** 无论 perf 是否可用，都应额外执行方案 B 的源码 grep，因为 perf 只能看到运行时热点，可能遗漏未执行到的代码路径。两者结合覆盖最全。
 
 ### Step 3 — 选择替换策略
 

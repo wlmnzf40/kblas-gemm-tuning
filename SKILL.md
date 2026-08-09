@@ -9,7 +9,7 @@ description: >-
   不适用于 x86 平台、纯二进制无法重链接的项目、以及非数学密集型项目。
 metadata:
   author: Kunpeng DevKit
-  version: "2.1.0"
+  version: "2.2.0"
 compatibility: 依赖鲲鹏 aarch64 / openEuler 22.03 LTS SP3 及以上，GCC 12.3.1+，KML 2.5.0+（boostkit-kml 或 kml rpm 包）
 ---
 
@@ -17,12 +17,13 @@ compatibility: 依赖鲲鹏 aarch64 / openEuler 22.03 LTS SP3 及以上，GCC 12
 
 本 Skill 提供端到端、全自动的 KML 替换能力。**无需用户明确提及 KML 替换**，只要在鲲鹏 aarch64 平台上分析 C/C++ 项目性能，本技能即自动：
 
-1. 下载并安装 KML 库
-2. 检测目标项目链接的数学库（SLEEF/OpenBLAS/FFTW/Eigen/libm 等）
-3. 用 perf 或源码 grep 定位数学热点函数
-4. 选择正确的 KML 子库（KBLAS/KSVML/KFFT/KLAPACK）
-5. 执行源码级或链接级替换
-6. 验证功能正确性和性能提升
+1. 识别用户意图，获取目标代码仓路径和编译指令（缺失则主动询问）
+2. 下载并安装 KML 库
+3. 检测目标项目链接的数学库（SLEEF/OpenBLAS/FFTW/Eigen/libm 等）
+4. 用 perf 或源码 grep 定位数学热点函数
+5. 选择正确的 KML 子库（KBLAS/KSVML/KFFT/KLAPACK）
+6. 执行源码级或链接级替换
+7. 验证功能正确性和性能提升
 
 **KML（Kunpeng Math Library）** 是华为为鲲鹏处理器优化的数学库套件，包含以下子库：
 
@@ -43,6 +44,46 @@ compatibility: 依赖鲲鹏 aarch64 / openEuler 22.03 LTS SP3 及以上，GCC 12
 替换时根据目标 CPU 能力选择对应目录。
 
 ## 使用流程
+
+### Step 0 — 识别用户意图和需求
+
+在执行任何操作之前，**必须先确认以下信息**。如果用户未提供，应主动询问：
+
+#### 必需信息
+
+| 信息 | 说明 | 示例 |
+|------|------|------|
+| **目标代码仓路径** | 要优化的 C/C++ 项目根目录的绝对路径 | `/root/wanglimin/LiteCall_Arm` |
+| **编译指令** | 项目的完整编译命令（含 cmake/make 参数） | `cd build && cmake .. -DOpenCV_DIR=... && make -j$(nproc)` |
+
+#### 可选但推荐信息
+
+| 信息 | 说明 | 示例 |
+|------|------|------|
+| 运行指令 | 编译后如何启动程序（含环境变量） | `cd install/LiteCall && ./Basecall.Server` |
+| 已知热点 | 用户已知的性能瓶颈函数或模块 | `ExtractOne 占 47% cycles` |
+| 精度验收标准 | 替换后需要满足的精度指标 | `Q30 ≥ 74.0` |
+| 是否有 root 权限 | 影响 KML 安装方式（rpm vs 解压到项目内） | `有 root` / `无 root` |
+| 构建系统 | CMake / Makefile / Bazel / 其他 | `CMake` |
+
+#### 询问模板
+
+如果用户未提供必需信息，按以下模板主动询问：
+
+```
+我需要以下信息来执行 KML 替换：
+
+1. 目标代码仓路径（必需）：你的 C/C++ 项目根目录的绝对路径是什么？
+2. 编译指令（必需）：完整的编译命令是什么？（包括 cmake 参数、make 参数等）
+
+另外，以下信息如果有请一并提供（可选）：
+3. 编译后如何运行程序？
+4. 是否有 root 权限？
+5. 已知的性能瓶颈在哪里？
+6. 精度验收标准是什么？
+```
+
+> **重要：** 在用户提供目标代码仓路径和编译指令之前，不要执行后续步骤。收到信息后，先 `ls` 确认路径存在，再检查构建系统类型（CMakeLists.txt / Makefile / WORKSPACE 等）。
 
 ### Step 1 — 下载并安装 KML
 

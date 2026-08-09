@@ -128,20 +128,6 @@ Client --> Server : gRPC Compute/Sweep
 @enduml
 ```
 
-### 2.3 端到端实施阶段
-
-| 阶段 | 通用动作 | TensorFlow Serving / KML 专有动作 | 交付物 |
-| --- | --- | --- | --- |
-| 1. 对象准备 | 确认源码、编译器、运行平台、候选库 | 固定 TF Serving commit、Bazel 版本；将 KML vendor 到 `third_party/kml` | 环境清单与制品校验值 |
-| 2. Workload 定义 | 选取业务 shape、并发度、预热和采样次数 | 使用 `gemm_server`/`gemm_client`，保留生产 shape sweep | 可重复的压测命令 |
-| 3. 原始基线 | 测量未优化延迟、吞吐、CPU 和缓存指标 | 先构建未 patch 的 Eigen contraction 路径 | Eigen 基线表 |
-| 4. 动态定位 | `perf stat/record/report` 定位热点和调用链 | 展开 TensorFlow executor、MatMul、Eigen contraction | `perf.data` 与热点报告 |
-| 5. 静态兜底 | 从源码、依赖和 ELF 建立证据链 | 检查 `tfops::MatMul`、`core_cpu`、external TF 头文件 | 标注限制的静态定位报告 |
-| 6. 方案设计 | 核对 API 语义、线程模型和回退条件 | 将 `dnnl_sgemm` 点替换为 KBLAS/Eigen 分支 | 接口映射与风险清单 |
-| 7. 构建集成 | 链接候选库，验证符号和运行时依赖 | 修改 Bazel cache 与 `.bazelrc`，执行 `nm`/`ldd` | 可运行的同路径 binary |
-| 8. 正确性验证 | 比较输出、误差、边界值和失败行为 | 通过 Compute RPC 比较 M×N 输出 | 正确性报告 |
-| 9. 性能验收 | 在相同条件下重复测试并分 shape 分析 | 用 `--backend=kblas|eigen` 双实例对比 | GFLOPS/延迟基线与适用范围 |
-
 ---
 
 ## 3. 组件设计
@@ -180,38 +166,7 @@ stop
 3. 在应用 KML patch 之前先生成 Eigen 基线。Graph 和 `ClientSession` 在进程内复用，避免每次请求重建图。
 4. KML 使用 aarch64 RPM；无 root 环境通过 `rpm2cpio` 解包到 TF Serving 的 `third_party/kml`，避免 Bazel execution root 拒绝外部 include 路径。
 
-#### 3.2 模块结构图
-
-```plantuml
-@startuml
-skinparam defaultFontName "Microsoft YaHei"
-skinparam classAttributeIconSize 0
-class EnvironmentRecord {
-  + sourceCommit: string
-  + compilerVersion: string
-  + bazelVersion: string
-  + cpuAndOs: string
-  + libraryChecksum: string
-}
-class WorkloadSpec {
-  + shapes: list<M,K,N>
-  + warmup: int
-  + iterations: int
-  + concurrency: int
-  + threadConfig: map
-}
-class BaselineResult {
-  + avgMs: double
-  + p50Ms: double
-  + p99Ms: double
-  + gflops: double
-}
-EnvironmentRecord --> BaselineResult
-WorkloadSpec --> BaselineResult
-@enduml
-```
-
-#### 3.3 接口设计
+#### 3.2 接口设计
 
 ```bash
 git clone --branch 2.17.0 <TF_SERVING_GIT_URL> "$REPO"
@@ -229,7 +184,7 @@ sha256sum /tmp/boostkit-kml-1.7.0-1.aarch64.rpm
 
 `<TF_SERVING_GIT_URL>` 由项目实际代码托管地址替换。离线环境应预先将 RPM 和 Bazel 依赖放入受控制品库或 `DISTDIR`，不得在不同测试轮次临时切换依赖来源。
 
-#### 3.4 存储数据设计及描述
+#### 3.3 存储数据设计及描述
 
 - **环境记录**：TF Serving commit、Bazel/GCC 版本、OS/kernel、CPU、KML RPM SHA-256。
 - **Workload 记录**：shape、数据类型、随机种子、warmup、iters、并发和线程配置。
@@ -279,36 +234,7 @@ stop
 2. 静态兜底从 `server.cc` 的 `tfops::MatMul` 开始，检查 BUILD 中 `//tensorflow/cc:cc_ops`、`//tensorflow/core:core_cpu` 等依赖，再进入 Bazel `output_base/external/org_tensorflow` 查找 contraction 实现。
 3. 本期候选替换点限定为 FP32 contraction SGEMM。int8 路径和非 MatMul 热点不纳入 KBLAS 性能结论。
 
-#### 3.2 模块结构图
-
-```plantuml
-@startuml
-skinparam defaultFontName "Microsoft YaHei"
-skinparam classAttributeIconSize 0
-class DynamicProfiler {
-  + collectCounters(pid): PerfStat
-  + collectCallgraph(pid): PerfData
-  + resolveSymbols(data): CallGraph
-}
-class StaticAnalyzer {
-  + traceSource(): SourceChain
-  + inspectBuildDeps(): TargetChain
-  + inspectElf(): SymbolEvidence
-}
-class OptimizationDecision {
-  + hotspot: string
-  + dataTypeAndLayout: string
-  + targetCallsite: string
-  + limitations: list
-  + confidence: dynamic|static
-}
-DynamicProfiler --> OptimizationDecision : 成功定位
-DynamicProfiler --> StaticAnalyzer : 定位失败
-StaticAnalyzer --> OptimizationDecision
-@enduml
-```
-
-#### 3.3 接口设计
+#### 3.2 接口设计
 
 **动态分析接口**：
 
@@ -339,7 +265,7 @@ objdump -dC bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_server | \
 
 静态证据至少包含三层：Graph 存在 MatMul、构建依赖包含 CPU OpKernel、external TF 源码或 ELF 指向 contraction。若优化 binary 已 strip，应保存同 build-id 的未剥离 binary 或 Bazel 中间产物。
 
-#### 3.4 存储数据设计及描述
+#### 3.3 存储数据设计及描述
 
 - `perf.data` 必须与对应 binary、build-id、kernel 版本和压测参数一起归档。
 - 保存 `perf report --stdio` 和 `perf script` 文本，便于无原环境时审查。
@@ -388,36 +314,7 @@ stop
 4. 脚本对无法识别的 TF 版本打印实际代码片段，并在 `dnnl_sgemm` 仍残留时失败退出。
 5. 当前部署模板的 `server.cc` 只解析 `--addr`；目标 TF Serving 集成版本还必须把 `--backend` 接到 `tf_serving_kblas_enabled`。该接线未完成时，不能声称双后端切换有效。
 
-#### 3.2 模块结构图
-
-```plantuml
-@startuml
-skinparam defaultFontName "Microsoft YaHei"
-skinparam classAttributeIconSize 0
-class BackendAdapter {
-  + validateSemantics(): bool
-  + selectBackend(): KBLAS|Eigen
-}
-class "setup_kblas.sh" as Setup {
-  + detectLibrary(): path
-  + updateBazelConfig(): void
-}
-class "apply_kblas_patch.sh" as Patch {
-  + locateHeader(): path
-  + patchFp32Callsite(): void
-  + validatePatch(): bool
-}
-class ContractionKernel {
-  + cblas_sgemm(...): void
-  + tf_serving_eigen_sgemm(...): void
-}
-BackendAdapter --> Setup
-Setup --> Patch
-Patch --> ContractionKernel
-@enduml
-```
-
-#### 3.3 接口设计
+#### 3.2 接口设计
 
 ```bash
 bash scripts/setup_kblas.sh [BAZEL_BIN] [KML_LIB_DIR]
@@ -436,7 +333,7 @@ ldd bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_server | \
 export LD_LIBRARY_PATH="$KML_LIB:${LD_LIBRARY_PATH:-}"
 ```
 
-#### 3.4 存储数据设计及描述
+#### 3.3 存储数据设计及描述
 
 - 首次 patch 前保留 `eigen_contraction_kernel.h.bak_dnnl`。
 - `.bazelrc` 保存 KML 编译宏、OpenMP、aarch64 优化和链接参数。
@@ -483,39 +380,7 @@ stop
 3. `compare_backends.sh` 启动同一 server binary 的 KBLAS/Eigen 实例，并用同一 client 参数顺序测试。退出 trap 负责回收进程和临时日志。
 4. 仓库脚本提供 `shape_sweep` 模式，但当前 `client.cc` 仅实现 `sweep` 和 `compute`；生产 shape 模式在目标集成版本实现并验证前，应标记为待完成项。
 
-#### 3.2 模块结构图
-
-```plantuml
-@startuml
-skinparam defaultFontName "Microsoft YaHei"
-skinparam classAttributeIconSize 0
-class GEMMRunner {
-  - session: ClientSession
-  - mutex: mutex
-  + Run(A, B, C): milliseconds
-}
-class GEMMServiceImpl {
-  + Compute(request): ComputeResponse
-  + Sweep(request): SweepResponse
-}
-class BenchmarkClient {
-  + runCompute(): Stats
-  + runSweep(): list<Stats>
-}
-class AcceptanceReport {
-  + correctness: result
-  + latency: avg/p50/p99
-  + throughput: gflops
-  + applicableShapes: list
-  + fallbackShapes: list
-}
-GEMMServiceImpl *-- GEMMRunner
-BenchmarkClient --> GEMMServiceImpl : gRPC
-BenchmarkClient --> AcceptanceReport
-@enduml
-```
-
-#### 3.3 接口设计
+#### 3.2 接口设计
 
 ```protobuf
 rpc Compute(ComputeRequest) returns (ComputeResponse);
@@ -534,7 +399,7 @@ bash scripts/compare_backends.sh compute \
   --M=2048 --K=2048 --N=2048 --iters=30 --warmup=5
 ```
 
-#### 3.4 存储数据设计及描述
+#### 3.3 存储数据设计及描述
 
 - 正确性报告保存输入 shape、随机种子、参考输出摘要、最大绝对/相对误差。
 - 性能报告保存每次原始延迟、统计结果、线程配置、后端日志和复现命令。

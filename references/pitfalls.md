@@ -1,5 +1,8 @@
 # 实际遇到的坑与解决方案
 
+> 本文档保留原 TF-Serving KBLAS 替换 SKILL 中的 pitfalls 内容。
+> 通用 KML 替换的常见问题参见 [SKILL.md](../SKILL.md) 的常见问题速查表。
+
 ## 坑 1：Bazel 沙箱拒绝外部绝对路径
 
 **错误信息：**

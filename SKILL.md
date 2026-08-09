@@ -1,184 +1,335 @@
 ---
-name: kblas-gemm-tuning
-description: 这是 KBLAS 矩阵乘调优技能，提供在鲲鹏平台用华为 KML 的 cblas_sgemm 替换 Eigen 矩阵乘内核、并通过运行时 --backend 开关对比 GFLOPS 的能力。在用户提及 KBLAS、KML、鲲鹏矩阵乘优化、TF-Serving GEMM 性能对比、cblas_sgemm、Eigen 内核替换等场景下触发。适用于已编译过 TF-Serving 的鲲鹏 aarch64 环境下做单矩阵乘内核级性能对比。不适用于 x86 平台、未编译过 TF 的环境，也不适用于完整模型端到端推理性能评估。
+name: kml-library-replacement
+description: >-
+  这是通用 KML（鲲鹏数学库）替换技能。给定一个目标 C/C++ 项目，自动判断其中哪些数学函数可以用
+  KML 库替换，选择正确的 KML 子库（KBLAS/KSVML/KFFT/KLAPACK 等），并指导大模型完成源码级或链接级的替换。
+  在用户提及 KML 替换、鲲鹏数学库加速、cblas_sgemm、SLEEF 替换、OpenBLAS 替换、向量数学函数加速、
+  KBLAS、KSVML、KFFT、"用 KML 加速这个项目"、"替换数学库" 等场景下触发。
+  适用于鲲鹏（aarch64）平台上、有源码或可重新链接的 C/C++ 项目。
+  不适用于 x86 平台、纯二进制无法重链接的项目、以及非数学密集型项目。
 metadata:
   author: Kunpeng DevKit
-  version: "1.0.0"
-compatibility: 依赖鲲鹏 aarch64 / openEuler 20.03 LTS SP3 及以上，Bazel 7.4.1，GCC 12.3.1+，boostkit-kml 1.7.0+，已编译过的 TF-Serving 2.17.0 仓库
+  version: "2.0.0"
+compatibility: 依赖鲲鹏 aarch64 / openEuler 22.03 LTS SP3 及以上，GCC 12.3.1+，KML 2.5.0+（boostkit-kml 或 kml rpm 包）
 ---
 
 ## 功能概述
 
-本 Skill 用于在鲲鹏（aarch64）平台上，将 TF-Serving 中 Eigen 矩阵乘内核替换为华为 KML 的 `cblas_sgemm`，并在**同一个 binary**内通过运行时 `--backend=kblas|eigen` 开关切换，对比两种 GEMM micro-kernel 的性能。
+本 Skill 提供端到端的 KML 替换能力：从分析目标项目的数学函数热点，到选择正确的 KML 子库，再到实施源码级或链接级替换，最终验证功能正确性和性能提升。
 
-**关键特点：**
-- 单一 binary，运行时切换 backend，两者走完全相同的 TF Session 调用路径
-- 不修改 WORKSPACE，不触发 TF 重新 fetch，所有 patch 在 Bazel cache 中就地完成
-- 所有步骤幂等可重复执行
+**KML（Kunpeng Math Library）** 是华为为鲲鹏处理器优化的数学库套件，包含以下子库：
 
-**调用路径：**
-```
-gemm_server --backend=kblas|eigen
-  → main() 设置 tf_serving_kblas_enabled = 1|0
-  → ClientSession::Run(MatMul/BatchMatMul)
-    → OpKernel::Compute()
-      → Eigen::Tensor::contract()
-        → ParallelMatMulKernel  [eigen_contraction_kernel.h, patch 后]
-          if (tf_serving_kblas_enabled)
-            → cblas_sgemm(CblasColMajor, ...) → libkblas.so  [鲲鹏 SVE/NEON 汇编]
-          else
-            → tf_serving_eigen_sgemm(...)    → Eigen 原生实现
-```
+| 子库 | .so 文件 | 功能 | 典型替换目标 |
+|------|---------|------|-------------|
+| KBLAS | libkblas.so | BLAS Level 1/2/3（sgemm/dgemm 等） | OpenBLAS, ATLAS, Eigen, MKL |
+| KSVML | libksvml.so | 向量化数学函数（exp, log, sin, cos 等） | SLEEF, libm, ivml |
+| KFFT | libkfft.so | 快速傅里叶变换 | FFTW, MKL FFT |
+| KLAPACK | libklapack.so | LAPACK 高级线性代数 | LAPACK, MKL LAPACK |
+| KM | libkm.so | 基础数学运行时 | libm |
+| KIPL | libkipl.so | 图像处理库 | OpenCV 部分算子 |
 
-`--backend` 只在最底层的 GEMM micro-kernel 调用上二选一，其余路径完全一致。这就是 `--backend=eigen` 能代表"原始 TF 执行路径"的原因。
+**关键路径差异：** KML 库按指令集架构分目录：
+- `/usr/local/kml/lib/neon/` — NEON 指令集（兼容所有鲲鹏处理器）
+- `/usr/local/kml/lib/sve/` — SVE 指令集（鲲鹏 920+ 支持 SVE1）
+- `/usr/local/kml/lib/noarch/` — 架构无关（KM、KE 等）
 
-## 环境约定
-
-使用前请根据实际环境设置以下变量（脚本内有合理默认值，可被环境变量覆盖）：
-
-```bash
-export REPO=<你的 tf_serving 仓库根目录>        # 例如 /home/<user>/tf_serving
-export BAZEL=<bazel 可执行文件绝对路径>          # 例如 /home/<user>/bazel-7.4.1
-export DISTDIR=<预下载依赖目录>                  # 例如 $REPO/../tf_new/dist
-export GCC_RPATH=<gcc lib64 路径>               # 例如 $(dirname $(dirname $(which gcc)))/lib64
-```
-
-> **重要约束**：TF 已编译过，不要执行 `bazel clean --expunge`。
+替换时根据目标 CPU 能力选择对应目录。
 
 ## 使用流程
 
-### Step 1 — 获取 KML（vendor 到仓库内，无需 root）
+### Step 1 — 安装 KML
 
 ```bash
-cd $REPO
+# 方式 A：rpm 安装（root 权限）
+rpm -ivh kml-2.5.0-1.aarch64.rpm
+# 库文件默认在 /usr/local/kml/lib/{neon,sve,noarch}/
 
-wget -O /tmp/boostkit-kml-1.7.0-1.aarch64.rpm \
-  https://repo.oepkgs.net/openeuler/rpm/openEuler-20.03-LTS-SP3/extras/aarch64/Packages/b/boostkit-kml-1.7.0-1.aarch64.rpm
-
+# 方式 B：解压到项目内（无 root 权限，推荐用于 Bazel 等沙箱构建）
 mkdir -p third_party/kml
-rpm2cpio /tmp/boostkit-kml-1.7.0-1.aarch64.rpm | cpio -idmv --no-absolute-filenames -D third_party/kml
+rpm2cpio kml-2.5.0-1.aarch64.rpm | cpio -idmv --no-absolute-filenames -D third_party/kml
+# 库文件在 third_party/kml/usr/local/kml/lib/{neon,sve,noarch}/
 ```
 
-**找到 libkblas.so 的实际目录（推荐 OMP 版）：**
+验证安装：
 ```bash
-KML_LIB=$(dirname $(find third_party/kml -name "libkblas.so" | grep omp | head -1))
-echo $KML_LIB   # 例如：third_party/kml/usr/local/kml/lib/kblas/omp
+ls /usr/local/kml/lib/neon/libksvml.so    # KSVML（NEON 版）
+ls /usr/local/kml/lib/sve/libksvml.so     # KSVML（SVE 版）
+ls /usr/local/kml/lib/noarch/libkm.so     # KM
+ls /usr/local/kml/lib/neon/libkblas.so    # KBLAS（NEON 版）
+ls /usr/local/kml/include/ksvml.h         # KSVML 头文件
 ```
 
-### Step 2 — 一键 Setup（含必需的头文件 patch）
+### Step 2 — 分析目标项目的数学函数热点
+
+#### 2.1 确认架构和 CPU 能力
 
 ```bash
-# 自动探测 KML 路径
-bash scripts/setup_kblas.sh $BAZEL
+# 确认是 aarch64
+uname -m   # 预期：aarch64
 
-# 或手动指定 libkblas.so 所在目录
-bash scripts/scripts/setup_kblas.sh $BAZEL $KML_LIB
+# 确认是否支持 SVE
+lscpu | grep -i sve    # 有输出则支持 SVE
+# 或者
+cat /proc/cpuinfo | grep -i Features | head -1 | tr ' ' '\n' | grep -i sve
 ```
 
-setup 脚本自动完成（每步幂等）：
-1. **repo.bzl 修复**：追加 `tf_serving_vendored`（缺失会报 `file does not contain symbol` 错误）
-2. **.bazelrc 路径**：用实际 KML lib 绝对路径写入 `-L` 和 `-rpath`
-3. **patch `eigen_contraction_kernel.h`**（**必需**）：把 `dnnl_sgemm` 调用点换成 `if (tf_serving_kblas_enabled) cblas_sgemm(...) else tf_serving_eigen_sgemm(...)`
+**决策：**
+- 支持 SVE → 优先使用 `/usr/local/kml/lib/sve/` 目录的库
+- 仅 NEON → 使用 `/usr/local/kml/lib/neon/` 目录的库
+- 不确定 → 用 NEON（兼容性最好）
 
-> **patch 是必需的，不是可选优化**。没有它，`--backend` 这个运行时开关在 TF 内部根本不存在。
+#### 2.2 确认当前链接了哪些数学库
 
-**如果提示 "patch deferred"**（Bazel cache 里还没有这个头文件）：
 ```bash
-$BAZEL build -c opt --distdir=$DISTDIR \
-  //tf_serving_gemm/tf_gemm_server:gemm_server 2>&1 | tail -5
-bash scripts/apply_kblas_patch.sh $BAZEL
+# 查看目标二进制依赖的数学库
+ldd <target_binary> | grep -iE 'blas|sleef|fftw|lapack|libm|openblas|atlas|mkl|vec'
+# 或查看编译参数
+grep -r '\-l.*blas\|\-l.*sleef\|\-l.*fftw\|\-l.*lapack\|\-l.*m[^a-z]' <build_dir>/ 
+# 或查看源码中的 include
+grep -rn '#include.*blas\|#include.*sleef\|#include.*fftw\|#include.*lapack\|#include.*m\.h' <src_dir>/
 ```
 
-### Step 3 — 编译（一个 binary，同时支持两种 backend）
+#### 2.3 用 perf 找到数学热点函数
 
 ```bash
-bash scripts/build_backends.sh $BAZEL
+# 采集热点（60 秒）
+perf record -F 99 -g -p <pid> -o /tmp/perf.data -- sleep 60
+# 查看热点函数 Top 20
+perf report -i /tmp/perf.data --stdio --no-children | grep -E '^\s+[0-9]' | head -20
 ```
 
-**编译后必做验证：**
+**判断标准：**
+- 热点函数名含 `sgemm`/`dgemm`/`gemm`/`matmul`/`contract` → **KBLAS 替换候选**
+- 热点函数名含 `exp`/`log`/`sin`/`cos`/`tan`/`pow`/`sqrt` → **KSVML 替换候选**
+- 热点函数名含 `fft`/`dft`/`rfft`/`cfft` → **KFFT 替换候选**
+- 热点函数名含 `solve`/`factorize`/`inverse`/`ev`/`svd`/`qr` → **KLAPACK 替换候选**
+
+### Step 3 — 选择替换策略
+
+根据项目构建系统和源码可改性，选择以下一种或多种策略：
+
+#### 策略 A：LD_PRELOAD 运行时替换（零代码修改）
+
+**适用场景：** 项目使用了标准 BLAS/LAPACK 接口（cblas_*），且 KML 提供相同接口。
+
 ```bash
-# cblas_sgemm 必须是 U（undefined 由 libkblas 提供）
-nm -D bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_server | grep cblas_sgemm
+export LD_PRELOAD=/usr/local/kml/lib/neon/libkblas.so:$LD_PRELOAD
+./target_binary
+```
+
+**限制：** 只能替换动态链接的库，静态链接的不行。且 KML 必须提供完全相同的符号。
+
+**验证：**
+```bash
+# 确认 KML 符号被加载
+ltrace -e 'cblas_sgemm' ./target_binary 2>&1 | head -5
+# 或
+LD_DEBUG=symbols ./target_binary 2>&1 | grep -i kblas | head -5
+```
+
+#### 策略 B：链接时替换（修改 CMakeLists.txt / Makefile）
+
+**适用场景：** 项目使用 CMake/Make 构建，可以修改链接参数。
+
+```cmake
+# CMake 示例：将 OpenBLAS 替换为 KBLAS
+# 原来：
+# find_package(BLAS REQUIRED)  # 可能找到 OpenBLAS
+# target_link_libraries(target ${BLAS_LIBRARIES})
+
+# 替换为：
+set(KML_ROOT "/usr/local/kml")
+set(KML_LIB_DIR "${KML_ROOT}/lib/neon")
+target_include_directories(target PRIVATE "${KML_ROOT}/include")
+target_link_directories(target PRIVATE "${KML_LIB_DIR}")
+target_link_libraries(target kblas km)
+```
+
+```makefile
+# Makefile 示例：将 SLEEF 替换为 KSVML
+# 原来：
+# LDLIBS += -lSLEEF
+# 替换为：
+KML_LIB = /usr/local/kml/lib/neon
+CFLAGS += -I/usr/local/kml/include
+LDFLAGS += -L$(KML_LIB) -Wl,-rpath,$(KML_LIB)
+LDLIBS += -lksvml -lkm
+```
+
+#### 策略 C：源码级替换（修改源代码）
+
+**适用场景：** 项目使用了非标准接口，或 KML 接口与原库不完全兼容，需要改源码。
+
+**KSVML 替换 SLEEF（标量函数）：**
+```cpp
+// 原来：
+#include "sleef.h"
+double result = Sleef_log10d2_u10(input);  // SLEEF 向量化 log10
+
+// 替换为：
+#include "ksvml.h"
+// KSVML 向量化接口（4 个 double 一组）：
+__m256d result = svml128_log10_f64(input);  // KSVML log10
+// 或标量接口：
+double result = svml_log10_f64(input);      // KSVML 标量 log10
+```
+
+**KBLAS 替换 Eigen GEMM（源码级）：**
+```cpp
+// 原来：
+Eigen::MatrixXf C = A * B;  // Eigen 矩阵乘
+
+// 替换为：
+#include "cblas.h"
+cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
+            M, N, K, 1.0f, A.data(), M, B.data(), K, 0.0f, C.data(), M);
+```
+
+**KFFT 替换 FFTW：**
+```cpp
+// 原来：
+#include "fftw3.h"
+fftw_plan plan = fftw_plan_dft_r2c_1d(N, in, out, FFTW_ESTIMATE);
+fftw_execute(plan);
+
+// 替换为：
+#include "kfft.h"
+// KFFT 接口与 FFTW 不同，需查阅 kfft.h 确认对应接口
+```
+
+### Step 4 — 确定正确的 KML 库路径和头文件
+
+```bash
+# 头文件目录
+KML_INCLUDE=/usr/local/kml/include
+
+# 库文件目录（根据 CPU 能力选择）
+if [ -d /usr/local/kml/lib/sve ] && lscpu | grep -q SVE; then
+    KML_LIB=/usr/local/kml/lib/sve
+else
+    KML_LIB=/usr/local/kml/lib/neon
+fi
+
+# noarch 目录始终需要（KM 等基础库在这里）
+KML_NOARCH=/usr/local/kml/lib/noarch
+
+echo "KML_INCLUDE=$KML_INCLUDE"
+echo "KML_LIB=$KML_LIB"
+echo "KML_NOARCH=$KML_NOARCH"
+```
+
+### Step 5 — 编译和验证
+
+#### 5.1 编译时设置环境
+
+```bash
+export PATH=/opt/openEuler/gcc-toolset-12/root/usr/bin:$PATH
+export LD_LIBRARY_PATH=$KML_LIB:$KML_NOARCH:$LD_LIBRARY_PATH
+# 如果用 GCC 12.3.1，还需设置：
+export LD_LIBRARY_PATH=/opt/openEuler/gcc-toolset-12/root/usr/lib64:$LD_LIBRARY_PATH
+```
+
+#### 5.2 验证替换生效
+
+```bash
+# 1. 确认 KML 符号被引用（U = undefined，由 KML 提供）
+nm -D <target_binary> | grep -E 'cblas_sgemm|svml128|kfft'
 # 预期：U cblas_sgemm
 
-# ldd 必须找到 libkblas.so
-ldd bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_server | grep kblas
-# 预期：libkblas.so => <repo>/third_party/kml/.../libkblas.so
+# 2. 确认 ldd 能找到 KML 库
+ldd <target_binary> | grep -E 'kblas|ksvml|kfft|km\.so'
+# 预期：libkblas.so => /usr/local/kml/lib/...
+
+# 3. 如果替换 SLEEF，确认 SLEEF 不再被链接
+ldd <target_binary> | grep -i sleef
+# 预期：无输出（已完全替换）
 ```
 
-不带 `--config=kml_kblas` 编译时，`--backend=kblas` 会启动时直接报错退出（不会静默 fallback）。带了 `--config=kml_kblas` 但 patch 没生效时，`cblas_sgemm` 符号可能不存在——**先看 nm/ldd 再开始对比**。
+#### 5.3 性能对比
 
-### Step 4 — 运行与对比
-
-必须设置 LD_LIBRARY_PATH：
 ```bash
-export LD_LIBRARY_PATH=$KML_LIB:$LD_LIBRARY_PATH
+# 替换前基线（如果有备份）
+./target_binary_original 2>&1 | tee /tmp/before.log
+
+# 替换后
+./target_binary 2>&1 | tee /tmp/after.log
+
+# perf stat 对比
+perf stat -p <pid> -e cycles,instructions,dTLB-load-misses,LLC-load-misses -- sleep 30 2>&1
+# 关注 IPC（instructions/cycles 比值）是否提升
 ```
 
-一键对比（推荐）：
-```bash
-bash scripts/compare_backends.sh              # sweep：方阵 128~2048
-bash scripts/compare_backends.sh shape_sweep  # 57 个生产 shapes
+### Step 6 — 验证功能正确性
+
+**关键：** 数学库替换后必须验证结果一致性。
+
+```cpp
+// 在关键路径上添加对比检查（临时）：
+// 1. 保存替换前的计算结果
+// 2. 替换后比较结果
+// 3. 容差判断（浮点数不可能完全一致）
+bool check_result(const float* a, const float* b, int n, float eps = 1e-4) {
+    for (int i = 0; i < n; i++) {
+        if (fabsf(a[i] - b[i]) > eps * (1.0f + fabsf(a[i]))) {
+            printf("MISMATCH at %d: %f vs %f\n", i, a[i], b[i]);
+            return false;
+        }
+    }
+    return true;
+}
 ```
 
-手动起两个实例：
-```bash
-nohup ./bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_server \
-  --backend=kblas --addr=0.0.0.0:50052 > kblas.log 2>&1 &
-sleep 2
-cat kblas.log   # 必须有 "backend=kblas"
+## KML 函数速查表
 
-nohup ./bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_server \
-  --backend=eigen --addr=0.0.0.0:50053 > eigen.log 2>&1 &
-sleep 2
-cat eigen.log   # backend=eigen
+### KSVML（向量化数学函数）
 
-./bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_client --host=localhost:50052 --mode=sweep
-./bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_client --host=localhost:50053 --mode=sweep
-```
+| 原函数 | KSVML 向量化接口 | 数据类型 | 宽度 |
+|--------|-----------------|---------|------|
+| `exp` | `svml128_exp_f32` / `svml256_exp_f32` | float | 4/8 |
+| `exp` | `svml128_exp_f64` / `svml256_exp_f64` | double | 2/4 |
+| `log` | `svml128_log_f32` / `svml128_log_f64` | float/double | 4/2 |
+| `log10` | `svml128_log10_f64` | double | 2 |
+| `sin` | `svml128_sin_f32` / `svml128_sin_f64` | float/double | 4/2 |
+| `cos` | `svml128_cos_f32` / `svml128_cos_f64` | float/double | 4/2 |
+| `pow` | `svml128_pow_f32` / `svml128_pow_f64` | float/double | 4/2 |
+| `sqrt` | `svml128_sqrt_f32` | float | 4 |
 
-**正常输出示例：**
-```
-=== adx ===
-MxKxN         cnt  avg_ms  GFLOPS
-512x512x512    30   2.34   115.2
-...
-```
+> **注意：** NEON 上 float32x4_t 对应 `svml128_*_f32`，double 一次处理 2 个对应 `svml128_*_f64`。SVE 上宽度可变。
 
-## 验证清单
+### KBLAS（BLAS 函数）
 
-- [ ] KML 库已安装到 `third_party/kml/`
-- [ ] `scripts/setup_kblas.sh` 执行成功，三项检查全部 OK
-- [ ] `nm -D` 显示 `U cblas_sgemm`
-- [ ] `ldd` 显示 `libkblas.so` 能被找到
-- [ ] 两个 backend 都能正常启动，server.log 中有 `backend=kblas` / `backend=eigen`
-- [ ] client 输出有实际数据行（不是只有表头）
-- [ ] 两个 backend 的 GFLOPS 存在差异（若几乎相同，说明 patch 没生效）
+| 原函数 | KBLAS 接口 | 说明 |
+|--------|-----------|------|
+| `sgemm` | `cblas_sgemm(CblasColMajor, ...)` | 单精度矩阵乘 |
+| `dgemm` | `cblas_dgemm(CblasColMajor, ...)` | 双精度矩阵乘 |
+| `sgemv` | `cblas_sgemv(...)` | 矩阵-向量乘 |
+| `strsm` | `cblas_strsm(...)` | 三角求解 |
+| `saxpy` | `cblas_saxpy(...)` | 向量运算 |
+
+> **KBLAS 子目录：** `libkblas.so` 在 `kblas/omp/` 目录下（OpenMP 版），还有 `kblas/seq/`（串行版）。
 
 ## 常见问题速查
 
 | 错误 | 原因 | 修复 |
 |------|------|------|
-| `does not contain symbol 'tf_serving_vendored'` | repo.bzl 版本旧 | `setup_kblas.sh` 自动追加 |
-| `--backend=kblas requires building with --config=kml_kblas` | binary 没带 KML 编译 | 重新跑 `build_backends.sh` |
-| `libkblas.so: cannot open` | LD_LIBRARY_PATH 未设 | `export LD_LIBRARY_PATH=$KML_LIB:$LD_LIBRARY_PATH` |
-| client 输出无数据行 | server crash 或超时 | 看 server.log；检查 nm/ldd |
-| 两个 backend GFLOPS 几乎相同 | 头文件 patch 没生效 | 重跑 `apply_kblas_patch.sh`，检查 WARNING，重新编译 |
-| `CONTENT_DOES_NOT_MATCH_TARGET` in fetch | 改了 WORKSPACE 触发 re-fetch | 不要改 WORKSPACE，只跑 `setup_kblas.sh` |
-| `include path references a path outside of execution root` | KML 在仓库外 | 把 KML 复制到 `$REPO/third_party/kml/` |
-| Bazel 版本不匹配 | 用了旧版本 Bazel | 用 WORKSPACE 要求的版本（通常 7.4.1） |
-
-## 进阶参考
-
-- Patch 的技术细节和调用链：参见 [references/patch-internals.md](references/patch-internals.md)
-- 实际遇到的坑与解决方案：参见 [references/pitfalls.md](references/pitfalls.md)
-- 性能基线测试结果：参见 [references/performance-baseline.md](references/performance-baseline.md)
-- .bazelrc KML 配置示例：参见 [assets/bazelrc.kml_example](assets/bazelrc.kml_example)
+| `cannot open shared object file 'libksvml.so'` | LD_LIBRARY_PATH 未包含 KML 库目录 | `export LD_LIBRARY_PATH=$KML_LIB:$KML_NOARCH:$LD_LIBRARY_PATH` |
+| `undefined symbol: cblas_sgemm` | 编译时未链接 KBLAS | 添加 `-lkblas -L$KML_LIB` |
+| `undefined symbol: svml128_exp_f64` | 未包含 ksvml.h 或未链接 KSVML | `#include "ksvml.h"` + `-lksvml -lkm` |
+| 替换后性能没有变化 | LD_PRELOAD 未生效或静态链接 | 用 `ldd` 确认 KML 库被加载 |
+| 替换后结果不一致 | 浮点精度差异或接口参数顺序不同 | 检查 ColMajor/RowMajor、转置参数 |
+| `libstdc++.so.6: cannot load` | GCC 版本不匹配 | 设置 `LD_LIBRARY_PATH` 包含 GCC 12.3.1 lib64 |
+| Bazel 沙箱拒绝外部路径 | KML 在 execroot 外 | 将 KML 复制到项目 `third_party/kml/` |
 
 ## 环境要求
 
-- **操作系统**：openEuler 20.03-LTS-SP3 / 鲲鹏 aarch64
-- **编译器**：GCC 12.3.1+ / Bazel 7.4.1
-- **KML**：1.7.0+（boostkit-kml）
-- **TensorFlow**：2.17.0（TF-Serving）
-- **Python**：3.10+（如需相关依赖）
+- **操作系统**：openEuler 22.03 LTS SP3+ / 鲲鹏 aarch64
+- **编译器**：GCC 12.3.1+（gcc-toolset-12）
+- **KML**：2.5.0+（kml rpm 包）或 1.7.0+（boostkit-kml）
+- **CPU**：鲲鹏 920 / 920+ / 930 等
+
+## 进阶参考
+
+- 通用 KML 替换的实践案例（SLEEF→KSVML）：参见 [references/kml-replacement-practice.md](references/kml-replacement-practice.md)
+- TF-Serving 中 Eigen GEMM 替换为 KBLAS 的疑难案例：参见 [references/tf-serving-kblas-case-study.md](references/tf-serving-kblas-case-study.md)
+- Patch 技术细节（TF-Serving 专用）：参见 [references/patch-internals.md](references/patch-internals.md)
+- 实际遇到的坑与解决方案：参见 [references/pitfalls.md](references/pitfalls.md)

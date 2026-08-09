@@ -1,5 +1,9 @@
 # Patch 技术细节与调用链
 
+> 本文档保留原 TF-Serving KBLAS 替换 SKILL 中的 patch 技术细节。
+> 通用 KML 替换流程参见 [SKILL.md](../SKILL.md)。
+> 完整案例参见 [tf-serving-kblas-case-study.md](tf-serving-kblas-case-study.md)。
+
 ## Patch 做了什么
 
 `scripts/apply_kblas_patch.sh` 就地修改 Bazel cache 里的 `eigen_contraction_kernel.h`：

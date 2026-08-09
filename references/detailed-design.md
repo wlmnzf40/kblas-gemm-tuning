@@ -391,7 +391,7 @@ export LD_LIBRARY_PATH="$KML_LIB:${LD_LIBRARY_PATH:-}"
 
 ---
 
-### 组件四：正确性验证与性能验收
+### 组件四：可编译性运行与可运行性验证
 
 #### 3.1 组件功能整体流程
 
@@ -400,17 +400,14 @@ export LD_LIBRARY_PATH="$KML_LIB:${LD_LIBRARY_PATH:-}"
 skinparam defaultFontName "Microsoft YaHei"
 skinparam defaultFontSize 10
 start
-:以同一输入分别执行原后端和优化后端;
-:检查输出结构、数值误差和错误处理;
-if (正确性通过?) then (否)
-  :停止性能测试并检查接口语义映射;
+:执行用户指定编译命令;
+:检查编译结果;
+if (可编译性通过?) then (否)
+  :编译问题修复;
   stop
 endif
-:固定环境并执行 warmup;
-:对每组业务参数采集多轮延迟;
-:计算延迟、吞吐和操作特定指标;
-:检查 KML 日志、符号和进程存活;
-:分析获益范围、退化范围和异常输入;
+:可运行性验证;
+:运行用户输入的执行脚本;
 :形成适用范围与回退策略;
 stop
 @enduml
@@ -418,22 +415,41 @@ stop
 
 **通用流程说明**：
 
-1. **正确性先行**：使用确定性输入对比参考实现和 KML 实现，覆盖典型参数、边界值、非法参数、特殊浮点值和项目要求的数值容差。
-2. **公平测量**：两种实现必须使用相同程序入口、CPU/NUMA、线程、业务参数、warmup 和 iters；性能测试期间避免同时运行导致资源争抢。
-3. **分参数决策**：数学库替换不应假定所有输入均获益，应分别统计典型规模和边界输入，并为退化范围保留原实现。
-4. **指标适配**：所有候选均统计 avg/P50/P99 和吞吐；KBLAS 可增加 GFLOPS，KFFT 可增加变换/秒，其他子库使用与业务操作匹配的指标。
-5. **双重证据**：结果表之外还要保存日志和符号证据，证明测试实际进入了选定的 KML 子库。
+1. **执行用户指定编译命令**：优先复用用户或上层 Skill 提供的原项目编译脚本、构建目录、环境变量和依赖缓存，只追加 KML 替换所必需的 include、link 和 rpath 配置，避免擅自更换构建系统或清理已有缓存。
+2. **检查可编译性**：以编译命令退出码和目标产物是否生成作为第一层判断，同时检查编译日志中的头文件缺失、接口声明不匹配、符号未定义、链接顺序、ABI、架构参数以及 SVE/NEON 库选择错误。仅看到部分 target 成功不能视为目标软件编译通过。
+3. **处理编译失败**：编译失败时保留完整命令与日志，定位问题属于源码适配、构建配置还是环境依赖。修复后应重新执行同一编译入口；若无法在不改变功能语义的前提下修复，则撤销本次 KML 替换并输出阻塞原因，不进入运行验证。
+4. **执行可运行性验证**：编译通过后先检查目标产物的动态依赖和 KML 符号，再运行用户提供的执行脚本。用户脚本是判断目标软件能否在真实启动方式和输入下运行的依据，不能用临时编写的空载程序代替。
+5. **检查运行结果**：综合检查执行脚本退出码、进程存活、标准输出/错误日志、KML 动态库加载、目标函数符号以及业务输出。对于数值计算，还应与原实现比较结果结构和项目要求的数值容差。
+6. **形成适用范围与回退策略**：可编译且可运行后，记录已验证的架构、KML 子库、数据类型、输入范围和启动方式；未覆盖或验证失败的场景继续使用原数学库实现。性能对比属于可运行性通过后的后续验收，不得用性能数据代替编译和运行结论。
 
-**案例落地：通过 GEMM gRPC 服务完成对照验收**：
+**案例落地：验证 TensorFlow Serving KML 版本可编译、可运行**：
 
-通用流程要求先验证输出，再在相同条件下比较原实现和候选实现。本案例通过仓库中的 GEMM 服务完成这两个步骤：
+在 TensorFlow Serving 案例中，用户编译命令对应 Bazel 的 `gemm_server`/`gemm_client` target，用户执行脚本对应服务启动和 client 请求脚本：
 
-1. `GEMMRunner` 创建一次动态形状 Graph 和 `ClientSession`；`Run()` 用 mutex 保护 Session，计时范围覆盖 `ClientSession::Run`。
-2. Compute RPC 接收 row-major A、B 和 M/K/N，校验输入元素数，返回 C 及 `server_compute_ms`；Sweep RPC 在服务端生成固定种子矩阵，减少网络传输对纯内核计时的影响。
-3. `compare_backends.sh` 启动同一 server binary 的 KBLAS/Eigen 实例，并用同一 client 参数顺序测试。退出 trap 负责回收进程和临时日志。
-4. 仓库脚本提供 `shape_sweep` 模式，但当前 `client.cc` 仅实现 `sweep` 和 `compute`；生产 shape 模式在目标集成版本实现并验证前，应标记为待完成项。
+1. 使用 `build_backends.sh` 执行用户侧 Bazel 构建，确认两个目标产物生成，并通过 `nm`/`ldd` 验证 `cblas_sgemm` 和 `libkblas.so`。
+2. 启动 `gemm_server` 后检查进程存活和启动日志，再使用 `gemm_client --mode=compute` 作为执行脚本发起真实 MatMul 请求。
+3. Compute RPC 返回 M×N 输出和服务端计算时间；运行验证需检查 RPC 状态、输出元素数量和数值结果，而不只是确认端口可连接。
+4. KBLAS 与 Eigen 后端均能独立启动和完成请求后，才使用 `compare_backends.sh` 进入后续性能对比。
+5. 当前部署模板尚未完整接通 `--backend`，且 client 尚未实现 `shape_sweep`；这两项在目标集成版本完成前应列入未验证范围并保留 Eigen 回退。
 
 #### 3.2 接口设计
+
+**通用编译与运行接口**：
+
+```bash
+<user_build_command> > build.log 2>&1
+test $? -eq 0 && test -e <target_binary>
+
+ldd <target_binary> | rg -i 'kblas|ksvml|kfft|klapack|not found'
+nm -D <target_binary> | rg 'cblas_|kml|fft|lapack'
+
+<user_run_script> > run.log 2>&1
+test $? -eq 0
+```
+
+用户编译命令和执行脚本必须连同工作目录、环境变量和参数一起记录。若执行脚本负责启动后台服务，还需设置就绪检查、超时和退出清理，避免“进程启动成功但服务不可用”被误判为运行通过。
+
+**TensorFlow Serving 案例接口**：
 
 ```protobuf
 rpc Compute(ComputeRequest) returns (ComputeResponse);
@@ -454,9 +470,10 @@ bash scripts/compare_backends.sh compute \
 
 #### 3.3 存储数据设计及描述
 
-- 正确性报告保存输入 shape、随机种子、参考输出摘要、最大绝对/相对误差。
-- 性能报告保存每次原始延迟、统计结果、线程配置、后端日志和复现命令。
-- 基线汇总维护在 `references/performance-baseline.md`；不得仅保留“加速比”而丢失两端原始数据。
+- `build.log`：用户编译命令、工作目录、环境变量、退出码、错误分类和修复记录。
+- `run.log`：用户执行脚本、参数、退出码、进程/服务状态、动态库加载与业务输出。
+- `runtime-verification.json`：已验证的平台、KML 子库、输入范围、数值结论和回退条件。
+- TensorFlow Serving 案例额外保存 server/client 日志、Compute 输出摘要和 `nm`/`ldd` 结果；性能基线继续维护在 `references/performance-baseline.md`。
 
 ---
 

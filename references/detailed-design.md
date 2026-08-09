@@ -31,7 +31,7 @@
 
 ### 2.1 架构整体设计
 
-系统由准备层、构建层、服务层和测试层构成：准备层定位 KML 与 Bazel cache 并应用 patch；构建层将 KBLAS 配置链接进 server；服务层以 gRPC 暴露单次计算和批量 sweep；测试层启动不同后端实例并用同一 client 采样。
+系统由资源准备、热点定位、内核替换、服务验证和性能对比五个阶段构成。资源准备阶段获取 TensorFlow Serving 与 KML；热点定位阶段优先用 `perf` 确认真实负载的 GEMM 调用栈，在采样条件不足时退化为调用链和符号的静态识别；内核替换阶段定位 Bazel cache 并应用 patch；服务验证阶段通过 gRPC 驱动 TensorFlow `MatMul`；性能对比阶段用相同输入比较 KBLAS 与 Eigen。
 
 ```plantuml
 @startuml
@@ -44,7 +44,18 @@ skinparam DiamondBackgroundColor #FAEEDA
 skinparam DiamondBorderColor #854F0B
 
 start
-:检查 Bazel、TF Serving 编译缓存与 KML 动态库;
+:获取 TF Serving 源码、预下载依赖与 KML RPM;
+:完成一次原始 TF Serving 构建;
+
+partition "热点定位" {
+  :以真实模型或 GEMM 服务产生稳定负载;
+  :perf record / perf report 获取调用栈;
+  if (能定位热点符号?) then (是)
+    :确认 MatMul -> Tensor::contract -> ParallelMatMulKernel;
+  else (否)
+    :用源码、Bazel target、nm/objdump 静态识别 contraction 路径;
+  endif
+}
 
 partition "准备与构建" {
   :setup_kblas.sh 探测 libkblas.so;
@@ -67,6 +78,7 @@ else (否)
 endif
 
 :汇总 avg / P50 / P99 / GFLOPS;
+:保存环境、命令、符号证据与基线结果;
 stop
 @enduml
 ```
@@ -123,11 +135,164 @@ Client --> Server : gRPC
 
 部署代码以可复制到 TensorFlow 源码树的 Bazel package 形式提供；脚本以仓库根目录为锚点寻找配置、第三方库和构建产物。KML 推荐 vendor 到 `third_party/kml`，以避免 Bazel execution root 对外部 include 路径的限制。
 
+### 2.3 端到端实施阶段
+
+| 阶段 | 输入 | 核心动作 | 输出与准入条件 |
+| --- | --- | --- | --- |
+| 1. 获取资源 | TF Serving 2.17.0、KML 1.7.0 RPM、Bazel、离线依赖目录 | 下载或复用源码与依赖，将 KML 解包到仓库内 | `libkblas.so` 可解析，TF Serving 原始版本可构建 |
+| 2. 建立原始基线 | 未替换的 server、代表性模型或 shape | 固定线程、CPU 亲和性、矩阵集合、预热与迭代次数 | Eigen 基线延迟和 GFLOPS，测试环境记录完整 |
+| 3. 动态定位 | 稳态 MatMul 负载、带符号或可回溯 binary | `perf stat` 判断 CPU 特征，`perf record/report` 展开热点调用链 | 确认热点落入 contraction/GEMM，或记录无法定位的原因 |
+| 4. 静态兜底 | 源码、BUILD、ELF、Bazel external cache | 检查 Graph 的 MatMul、BUILD 依赖、`nm` 符号和 `objdump` 调用点 | 得到可审计的“图节点→OpKernel→contraction→SGEMM”证据链 |
+| 5. KML 替换 | 已定位的 contraction 头文件与 KML 路径 | 运行 setup 和 patch，以 `--config=kml_kblas` 重新构建 | `nm` 出现 `U cblas_sgemm`，`ldd` 正确解析 KML |
+| 6. 功能验证 | KBLAS/Eigen 两种后端、相同矩阵 | 比较输出维度、数值误差、错误处理和启动日志 | 结果在约定容差内，日志能证明实际后端 |
+| 7. 性能验收 | 相同 binary、相同输入和采样配置 | 重复 sweep/生产 shape 测试，记录 avg/P50/P99/GFLOPS | 给出分 shape 结论、回退范围和完整复现命令 |
+
+各阶段为顺序门禁：原始版本不能构建时不进入 patch；热点证据不足时必须完成静态证据链；符号或动态库验证失败时不得开始性能对比；功能正确性未通过时性能结果无效。
+
 ---
 
 ## 3. 组件设计
 
-### 组件一：环境准备与 contraction 内核 patch
+### 组件一：资源获取与 GEMM 热点定位
+
+#### 3.1 组件功能整体流程
+
+```plantuml
+@startuml
+skinparam defaultFontName "Microsoft YaHei"
+skinparam defaultFontSize 10
+start
+:准备 TF Serving 2.17.0 源码与匹配的 Bazel;
+:准备 DISTDIR 或允许 Bazel 获取依赖;
+:下载 KML aarch64 RPM;
+:无 root 解包到 third_party/kml;
+:修复 libkblas.so 符号链接并定位 OMP 库目录;
+:构建并运行未替换的 TF Serving 基线;
+:使用真实请求或固定 shape 持续施压;
+
+if (perf 可用且可得到调用栈?) then (是)
+  :perf stat 检查 cycles/instructions/cache-misses;
+  :perf record -g 采集进程;
+  :perf report 展开 MatMul 热点;
+else (否)
+  :确认 perf_event_paranoid、符号、栈回溯和采样时长;
+  if (调整后仍不可定位?) then (是)
+    :从 Graph/OpKernel/BUILD/ELF 静态建立调用证据链;
+  else (否)
+    :重新采样;
+  endif
+endif
+:确定替换点为 FP32 contraction SGEMM;
+:保存基线、符号与定位证据;
+stop
+@enduml
+```
+
+**流程说明**：
+
+1. **获取 TensorFlow Serving**：使用与目标环境一致的 2.17.0 源码快照。若目标机器已经成功编译过 TF Serving，应复用该工作树、Bazel `output_base` 和 `DISTDIR`，避免版本漂移以及重新下载大型依赖。
+2. **获取 KML**：下载 aarch64 的 boostkit-kml RPM。无 root 场景使用 `rpm2cpio | cpio` 解包到目标 TF Serving 仓库的 `third_party/kml`，使头文件和动态库处于 Bazel execution root 内。
+3. **建立未优化基线**：在应用任何 patch 前构建并运行 Eigen 路径。固定 CPU 亲和性、OMP/TF 线程数、矩阵 shape、warmup 与 iters；后续 KML 测试必须复用这些条件。
+4. **动态定位优先**：对稳定运行的服务进程先执行 `perf stat`，再以 99 Hz 左右频率采集调用栈。`perf report` 中应从 TensorFlow `MatMul`/执行器热点继续展开到 Eigen contraction、`ParallelMatMulKernel` 或 SGEMM 相关符号。
+5. **定位失败诊断**：`perf` 没有热点不等于没有 GEMM。常见原因包括 `kernel.perf_event_paranoid` 限制、binary 被 strip、缺少 frame pointer/DWARF、内联导致符号折叠、采样窗口过短、请求未进入预期图或负载被其他线程稀释。应逐项记录而不是直接判定替换点。
+6. **静态识别兜底**：动态采样仍不可用时，从服务端构图中的 `tfops::MatMul` 出发，检查 Bazel 的 `cc_ops`/`core_cpu` 依赖，再在 external TensorFlow 源码中追踪 MatMul OpKernel 到 `Eigen::Tensor::contract` 和 `eigen_contraction_kernel.h`；结合 `nm -C`、`readelf -Ws`、`objdump -dC` 证明目标 binary 中包含对应符号或调用引用。
+7. **替换范围控制**：本期只替换 FP32 SGEMM。KML 不支持的 int8 路径不纳入本次性能结论；小矩阵可能因调用和线程调度开销退化，需保留 Eigen 回退能力。
+
+#### 3.2 模块结构图
+
+```plantuml
+@startuml
+skinparam defaultFontName "Microsoft YaHei"
+skinparam classAttributeIconSize 0
+
+class "资源准备" as Acquire {
+  + checkout_tf_serving(version): tree
+  + prepare_distdir(): path
+  + download_kml_rpm(): file
+  + extract_kml(repo): path
+}
+
+class "动态定位" as Dynamic {
+  + perf_stat(pid, duration): counters
+  + perf_record(pid, duration): perf.data
+  + perf_report(data): callgraph
+}
+
+class "静态定位" as Static {
+  + trace_graph_to_kernel(): source_chain
+  + inspect_bazel_deps(): targets
+  + inspect_elf(binary): symbols
+}
+
+class "热点证据" as Evidence {
+  + baseline: latency/gflops
+  + callchain: text
+  + target_header: path
+  + limitations: list
+}
+
+Acquire --> Dynamic
+Dynamic --> Evidence : 定位成功
+Dynamic --> Static : 无权限/无符号/无有效栈
+Static --> Evidence
+@enduml
+```
+
+#### 3.3 接口设计
+
+**资源获取接口**：
+
+```bash
+git clone --branch 2.17.0 <TF_SERVING_GIT_URL> "$REPO"
+
+wget -O /tmp/boostkit-kml-1.7.0-1.aarch64.rpm \
+  https://repo.oepkgs.net/openeuler/rpm/openEuler-20.03-LTS-SP3/extras/aarch64/Packages/b/boostkit-kml-1.7.0-1.aarch64.rpm
+mkdir -p "$REPO/third_party/kml"
+rpm2cpio /tmp/boostkit-kml-1.7.0-1.aarch64.rpm | \
+  cpio -idmv --no-absolute-filenames -D "$REPO/third_party/kml"
+
+KML_LIB=$(dirname "$(find "$REPO/third_party/kml" -name libkblas.so \
+  -path '*/omp/*' -print -quit)")
+```
+
+`<TF_SERVING_GIT_URL>` 必须由项目使用的代码托管地址替换；文档不固化镜像站，以免下载到与生产构建不一致的 fork。下载后需记录 commit ID，并校验 RPM 架构为 aarch64。若网络受限，RPM 与 Bazel 依赖应在联网环境下载后放入受控制品库或 `DISTDIR`，目标机只做离线解包和构建。
+
+**动态热点定位接口**：
+
+```bash
+PID=$(pgrep -n gemm_server)
+perf stat -p "$PID" -e cycles,instructions,cache-references,cache-misses \
+  -- sleep 30
+perf record -F 99 -g --call-graph dwarf -p "$PID" -- sleep 60
+perf report --stdio --children --sort=dso,symbol | less
+perf script > perf.script.txt
+```
+
+若编译产物保留 frame pointer，可将 `--call-graph dwarf` 改为开销更低的 `fp`；否则应继续使用 DWARF。对多线程服务必须以 `-p PID` 覆盖进程全部线程，不要只采样主线程 TID。采样期间应持续发送请求，并在记录中保存 QPS、shape、线程配置和 CPU 亲和性。
+
+**静态识别接口**：
+
+```bash
+rg -n 'MatMul|Tensor::contract|ParallelMatMulKernel|dnnl_sgemm' \
+  deployment "$($BAZEL info output_base)/external/org_tensorflow"
+nm -C bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_server | \
+  rg 'MatMul|contract|ParallelMatMulKernel|sgemm'
+readelf -Ws bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_server | rg 'sgemm|MatMul'
+objdump -dC bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_server | \
+  rg -n 'cblas_sgemm|dnnl_sgemm|ParallelMatMulKernel'
+```
+
+静态证据至少包含三层：服务图中确有 `MatMul` 节点、构建依赖会链接 TensorFlow CPU OpKernel、external TensorFlow 源码或 ELF 指向 contraction SGEMM。仅搜索到函数名不能证明运行时一定走该路径，因此最终报告应将其标记为“静态识别”，并在具备 perf 条件后补做动态验证。
+
+#### 3.4 存储数据设计及描述
+
+- **下载制品**：KML RPM、TF Serving commit ID、Bazel 版本和依赖清单应纳入项目制品记录；RPM 建议同时保存 SHA-256。
+- **性能原始数据**：保留 `perf.data`、`perf.script.txt`、`perf report --stdio` 输出以及对应的负载参数；`perf.data` 与具体 binary/build-id 绑定，不应脱离构建产物单独归档。
+- **定位报告**：记录动态热点、静态调用证据、未解析符号、权限限制与最终替换文件，避免后续升级 TF 时沿用失效结论。
+
+---
+
+### 组件二：环境准备与 contraction 内核 patch
 
 #### 3.1 组件功能整体流程
 
@@ -235,7 +400,7 @@ bash scripts/apply_kblas_patch.sh [BAZEL_BIN]
 
 ---
 
-### 组件二：GEMM gRPC 服务与数据协议
+### 组件三：GEMM gRPC 服务与数据协议
 
 #### 3.1 组件功能整体流程
 
@@ -345,7 +510,7 @@ gemm_client --host=<host:port> --mode=compute \
 
 ---
 
-### 组件三：构建与双后端性能对比编排
+### 组件四：构建与双后端性能对比编排
 
 #### 3.1 组件功能整体流程
 
@@ -466,6 +631,18 @@ bash scripts/setup_kblas.sh "$BAZEL" "$KML_LIB"
 
 **验收**：第二次执行不得重复追加 `tf_serving_vendored`，不得重复 patch 头文件；应明确输出 already present/already patched 类提示。WORKSPACE 内容和既有 dependency fetch 状态不应变化。
 
+同时记录以下资源信息，确保下载和构建输入可追溯：
+
+```bash
+git -C "$REPO" rev-parse HEAD
+sha256sum /tmp/boostkit-kml-1.7.0-1.aarch64.rpm
+rpm -qp --queryformat '%{NAME} %{VERSION}-%{RELEASE} %{ARCH}\n' \
+  /tmp/boostkit-kml-1.7.0-1.aarch64.rpm
+"$BAZEL" --version
+```
+
+**验收**：TF Serving commit、RPM SHA-256、RPM 架构和 Bazel 版本均写入测试记录；RPM 必须为 aarch64，KML 库必须来自本次记录的制品。
+
 ### 4.2 构建与链接验证
 
 ```bash
@@ -506,7 +683,33 @@ bash scripts/compare_backends.sh compute --M=2048 --K=2048 --N=2048 \
 - 脚本结束后两个 server 进程均被回收，临时日志被删除。
 - 性能结论按矩阵 shape 分析，不以单个尺寸推导所有负载；小矩阵和异常 shape 需保留 Eigen 对照数据。
 
-### 4.5 静态与文档一致性检查
+### 4.5 perf 动态热点定位测试
+
+```bash
+PID=$(pgrep -n gemm_server)
+perf stat -p "$PID" -e cycles,instructions,cache-references,cache-misses \
+  -- sleep 30
+perf record -F 99 -g --call-graph dwarf -p "$PID" -- sleep 60
+perf report --stdio --children --sort=dso,symbol > perf-report.txt
+```
+
+**验收**：采样窗口内持续有固定 shape 请求；报告能识别 TensorFlow 执行器、MatMul、Eigen contraction 或其下层 GEMM 热点，并保存 perf 版本、kernel、binary build-id、线程配置和请求参数。若调用栈显示 `[unknown]` 或只看到 gRPC/调度线程，应先增加负载和采样时长，再检查符号、DWARF 与 `perf_event_paranoid`，不得直接进入替换结论。
+
+### 4.6 perf 无法定位时的静态识别测试
+
+```bash
+OUTPUT_BASE=$("$BAZEL" info output_base)
+rg -n 'MatMul|Tensor::contract|ParallelMatMulKernel|dnnl_sgemm' \
+  deployment "$OUTPUT_BASE/external/org_tensorflow"
+nm -C bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_server | \
+  rg 'MatMul|contract|ParallelMatMulKernel|sgemm'
+readelf -Ws bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_server | \
+  rg 'sgemm|MatMul'
+```
+
+**验收**：测试记录必须同时给出：①服务构图中的 `MatMul`；②BUILD 中 TensorFlow CPU runtime/OpKernel 依赖；③external TensorFlow 的 contraction 实现或 binary 符号。若 binary 被 strip 导致后两项无法从 ELF 获取，应保存同 build-id 的未剥离文件或 Bazel 中间产物。报告标题须注明“静态识别，待动态验证”。
+
+### 4.7 静态与文档一致性检查
 
 ```bash
 bash -n scripts/setup_kblas.sh \

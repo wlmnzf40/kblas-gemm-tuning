@@ -479,7 +479,77 @@ bash scripts/compare_backends.sh compute \
 
 ## 4. 开发者测试
 
-### 4.1 平台能力与资源测试
+### 4.1 测试输入
+
+本次开发者测试以真实 TensorFlow Serving 仓库作为目标项目，通过自然语言调用本 Skill。建议将输入整理为以下形式，确保目标路径、优化目标和原始编译入口表达清晰：
+
+> 请使用 `kblas-gemm-tuning` Skill，帮助我为 `/home/wanglimin/tf_serving_newtest` 接入 KML。请复用项目原有构建方式和依赖缓存，不执行 `bazel clean --expunge`；完成环境检查、数学热点识别、KML 替换、可编译性验证和可运行性验证。项目原始编译命令如下：
+
+```bash
+cd /home/wanglimin/tf_serving_newtest
+
+/home/wanglimin/bazel-7.4.1 build -c opt \
+  --distdir=/home/wanglimin/tf_new/dist \
+  --define=no_cuda_support=true \
+  --define=no_nccl_support=true \
+  --define=no_kafka_support=true \
+  --define=no_google_cloud_support=true \
+  --repo_env=CC=/usr/bin/gcc \
+  --repo_env=CXX=/usr/bin/g++ \
+  --host_linkopt=-Wl,--disable-new-dtags \
+  --host_linkopt=-Wl,-rpath,/home/wanglimin/gcc-12.3.1-2025.12-aarch64-linux/lib64 \
+  --linkopt=-Wl,--disable-new-dtags \
+  --linkopt=-Wl,-rpath,/home/wanglimin/gcc-12.3.1-2025.12-aarch64-linux/lib64 \
+  //tf_serving_gemm/tf_gemm_server:gemm_server \
+  //tf_serving_gemm/tf_gemm_server:gemm_client
+```
+
+Skill 将该输入解析为以下测试上下文：
+
+| 字段 | 取值 | 使用方式 |
+| --- | --- | --- |
+| Skill | `kblas-gemm-tuning` | 执行数学热点分析和 KML 接入流程 |
+| 目标仓 | `/home/wanglimin/tf_serving_newtest` | 所有源码修改和构建命令的工作目录 |
+| Bazel | `/home/wanglimin/bazel-7.4.1` | 沿用用户指定版本，不从 `PATH` 随机选择 |
+| 依赖目录 | `/home/wanglimin/tf_new/dist` | 复用已下载依赖，避免重新 fetch |
+| C/C++ 编译器 | `/usr/bin/gcc`、`/usr/bin/g++` | 通过 `--repo_env` 传递给 Bazel |
+| GCC 运行库 | `/home/wanglimin/gcc-12.3.1-2025.12-aarch64-linux/lib64` | 保留原有 host/target rpath |
+| 构建目标 | `gemm_server`、`gemm_client` | 用于可编译性和后续可运行性验证 |
+
+后续测试命令统一使用以下环境变量，避免示例中的路径含义不明确：
+
+```bash
+export REPO=/home/wanglimin/tf_serving_newtest
+export BAZEL=/home/wanglimin/bazel-7.4.1
+export DISTDIR=/home/wanglimin/tf_new/dist
+export GCC_RPATH=/home/wanglimin/gcc-12.3.1-2025.12-aarch64-linux/lib64
+```
+
+原始命令必须先原样执行并保存为 Eigen 基线构建记录。完成 KML 配置和 patch 后，应在不删除任何原参数的前提下增加 `--config=kml_kblas`，形成优化版本编译命令：
+
+```bash
+cd /home/wanglimin/tf_serving_newtest
+
+/home/wanglimin/bazel-7.4.1 build -c opt \
+  --distdir=/home/wanglimin/tf_new/dist \
+  --define=no_cuda_support=true \
+  --define=no_nccl_support=true \
+  --define=no_kafka_support=true \
+  --define=no_google_cloud_support=true \
+  --repo_env=CC=/usr/bin/gcc \
+  --repo_env=CXX=/usr/bin/g++ \
+  --host_linkopt=-Wl,--disable-new-dtags \
+  --host_linkopt=-Wl,-rpath,/home/wanglimin/gcc-12.3.1-2025.12-aarch64-linux/lib64 \
+  --linkopt=-Wl,--disable-new-dtags \
+  --linkopt=-Wl,-rpath,/home/wanglimin/gcc-12.3.1-2025.12-aarch64-linux/lib64 \
+  --config=kml_kblas \
+  //tf_serving_gemm/tf_gemm_server:gemm_server \
+  //tf_serving_gemm/tf_gemm_server:gemm_client
+```
+
+**输入验收**：目标仓、Bazel、`DISTDIR`、编译器、GCC rpath 和两个 Bazel target 均可解析；原始编译命令能够作为未优化基线复现；优化命令与原命令相比只增加 KML 所需配置，不擅自删改用户参数。
+
+### 4.2 平台能力与资源测试
 
 ```bash
 git -C "$REPO" rev-parse HEAD
@@ -493,7 +563,7 @@ rpm -qp --queryformat '%{NAME} %{VERSION}-%{RELEASE} %{ARCH}\n' \
 
 **验收**：目标仓 commit、KML 制品校验值、aarch64 架构、SVE/NEON 决策、编译器和 CPU/OS 均进入记录；所选 KML 库目录与 CPU 能力一致。TensorFlow Serving 案例额外记录 Bazel、`DISTDIR` 和原始 Eigen 基线。
 
-### 4.2 数学库依赖与动态热点测试
+### 4.3 数学库依赖与动态热点测试
 
 ```bash
 ldd <target_binary> | \
@@ -504,7 +574,7 @@ perf report -i /tmp/perf.data --stdio --no-children > perf-report.txt
 
 **验收**：输出当前数学库依赖；采样期间持续运行固定 Workload；热点按 KBLAS、KSVML、KFFT、KLAPACK 候选分类。`perf` 不可用时记录原因，但仍继续执行静态扫描。
 
-### 4.3 源码静态扫描测试
+### 4.4 源码静态扫描测试
 
 ```bash
 rg -n -g '*.{c,cc,cpp,h,hpp}' \
@@ -516,7 +586,7 @@ rg -n 'find_package.*(BLAS|FFTW|LAPACK|SLEEF)|-l(blas|openblas|fftw|lapack|sleef
 
 **验收**：无论 `perf` 是否成功都执行静态扫描；报告包含源码调用、include、链接参数和构建依赖，并过滤测试、示例、vendor 和生成文件。仅静态命中的候选标记为“未被当前 Workload 动态覆盖”。
 
-### 4.4 Patch 幂等与链接测试
+### 4.5 Patch 幂等与链接测试
 
 ```bash
 bash scripts/setup_kblas.sh "$BAZEL" "$KML_LIB"
@@ -528,7 +598,7 @@ ldd bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_server | grep kblas
 
 **验收**：第二次 setup 不重复追加配置或 patch；`cblas_sgemm` 为动态未定义符号；`libkblas.so` 能解析到本次记录的制品目录。
 
-### 4.5 正确性测试
+### 4.6 正确性测试
 
 ```bash
 export LD_LIBRARY_PATH="$KML_LIB:${LD_LIBRARY_PATH:-}"
@@ -541,7 +611,7 @@ export LD_LIBRARY_PATH="$KML_LIB:${LD_LIBRARY_PATH:-}"
 
 **验收**：输出 shape 为 M×N，数值误差满足项目容差；A/B 元素数与 M/K/N 不一致时返回 `INVALID_ARGUMENT`。目标集成版本还需验证 `--backend` 确实修改运行时开关。
 
-### 4.6 性能验收测试
+### 4.7 性能验收测试
 
 ```bash
 bash scripts/compare_backends.sh sweep
@@ -551,7 +621,7 @@ bash scripts/compare_backends.sh compute \
 
 **验收**：两端参数和运行环境一致；每个 shape 均有有效 avg/P50/P99/GFLOPS；日志能确认实际 backend；脚本退出后进程被回收。结果按 shape 给出 KBLAS 适用范围和 Eigen 回退范围。
 
-### 4.7 静态与文档一致性检查
+### 4.8 静态与文档一致性检查
 
 ```bash
 bash -n scripts/setup_kblas.sh \

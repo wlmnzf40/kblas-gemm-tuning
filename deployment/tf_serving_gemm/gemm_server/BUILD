@@ -1,53 +1,56 @@
+# TF-runtime-backed GEMM gRPC server, built inside the TF Serving repo.
+#
+# TensorFlow is pulled into the Serving WORKSPACE as @org_tensorflow, so every
+# TF core target is referenced with that repo prefix. gRPC is @com_github_grpc_grpc
+# (the same repo TF/Serving already use, so protobuf/grpc versions match and there
+# are no symbol clashes).
+#
+# Proto plumbing uses the plain bazel rules (proto_library / cc_proto_library /
+# cc_grpc_library) rather than @org_tensorflow's tf_proto_library: this proto
+# imports nothing and needs no TF proto deps, so the plain rules are simpler and
+# don't couple us to any tf_proto_library signature changes across TF versions.
+
 load("@com_github_grpc_grpc//bazel:cc_grpc_library.bzl", "cc_grpc_library")
-load(
-    "//tensorflow:tensorflow.default.bzl",
-    "tf_grpc_cc_dependencies",
-)
-load(
-    "//tensorflow/core/platform:build_config.bzl",
-    "tf_proto_library",
-)
 
 package(default_visibility = ["//visibility:public"])
 
 # ── Proto + gRPC stubs ────────────────────────────────────────────────────────
-#
-# tf_proto_library(name = "gemm_proto") generates two targets:
-#   :gemm_proto     — proto_library
-#   :gemm_proto_cc  — cc_proto_library (gemm.pb.h / gemm.pb.cc)
-#
-# cc_grpc_library(grpc_only = True) adds just the gRPC stubs on top:
-#   :gemm_grpc      — gemm.grpc.pb.h / gemm.grpc.pb.cc
+# Header paths are repo-root-relative to the package, i.e.
+#   tf_serving_gemm/tf_gemm_server/proto/gemm.pb.h
+#   tf_serving_gemm/tf_gemm_server/proto/gemm.grpc.pb.h
+# which is exactly what server.cc / client.cc #include.
 
-tf_proto_library(
+proto_library(
     name = "gemm_proto",
     srcs = ["proto/gemm.proto"],
-    has_services = 1,
-    create_java_proto = False,
-    create_kotlin_proto = False,
+)
+
+cc_proto_library(
+    name = "gemm_cc_proto",
+    deps = [":gemm_proto"],
 )
 
 cc_grpc_library(
-    name = "gemm_grpc",
+    name = "gemm_cc_grpc",
     srcs = [":gemm_proto"],
-    grpc_only = True,
-    deps = [":gemm_proto_cc"],
+    grpc_only = True,  # messages come from :gemm_cc_proto; generate only the stubs
+    deps = [":gemm_cc_proto"],
 )
 
-# ── Server (TF C++ Session + MatMul op kernel) ────────────────────────────────
+# ── Server (direct BLAS/Eigen dispatch — no TF Session in hot path) ──────────
+# framework is kept for the transitive Eigen include path.
+# Built without --config=kml_kblas: Eigen only  (--backend=eigen, default)
+# Built with    --config=kml_kblas: KBLAS + Eigen (--backend=kblas|eigen, default=kblas)
 
 cc_binary(
     name = "gemm_server",
     srcs = ["server.cc"],
     deps = [
-        ":gemm_grpc",
-        ":gemm_proto_cc",
-        "//tensorflow/cc:cc_ops",        # generated standard_ops.h (MatMul, Placeholder)
-        "//tensorflow/cc:client_session",
-        "//tensorflow/cc:scope",
-        "//tensorflow/core:core_cpu",    # TF session / executor / op kernels
-        "//tensorflow/core:framework",
-    ] + tf_grpc_cc_dependencies(),       # expands to ["//tensorflow:grpc++"]
+        ":gemm_cc_grpc",
+        ":gemm_cc_proto",
+        "@org_tensorflow//tensorflow/core:framework",  # provides Eigen include path
+        "@com_github_grpc_grpc//:grpc++",
+    ],
 )
 
 # ── Client (gRPC only, no TF runtime dep) ────────────────────────────────────
@@ -56,7 +59,8 @@ cc_binary(
     name = "gemm_client",
     srcs = ["client.cc"],
     deps = [
-        ":gemm_grpc",
-        ":gemm_proto_cc",
-    ] + tf_grpc_cc_dependencies(),
+        ":gemm_cc_grpc",
+        ":gemm_cc_proto",
+        "@com_github_grpc_grpc//:grpc++",
+    ],
 )

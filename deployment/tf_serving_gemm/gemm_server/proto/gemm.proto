@@ -2,41 +2,83 @@ syntax = "proto3";
 package gemm;
 
 service GEMMService {
-  // Client sends A, B matrices; server runs tf.matmul and returns C + compute time.
+  // Single call: client sends A, B; server computes C = A*B and returns it
+  // along with the pure server-side compute time.
   rpc Compute (ComputeRequest) returns (ComputeResponse);
-  // Server benchmarks multiple square sizes internally; returns latency table.
+
+  // Sweep: client asks the server to benchmark a list of square sizes.
+  // Measurement happens entirely on the server (no network in the loop).
   rpc Sweep (SweepRequest) returns (SweepResponse);
+
+  // ShapeSweep: benchmark a list of arbitrary (possibly non-square, batched)
+  // GEMM shapes, e.g. the actual ops extracted from a production model.
+  // batch=1  -> plain  MatMul  [M,K] x [K,N]
+  // batch>1  -> BatchMatMul   [b,M,K] x [b,K,N]
+  rpc ShapeSweep (ShapeSweepRequest) returns (ShapeSweepResponse);
 }
 
+// ── Compute ──────────────────────────────────────────────────────────────────
+
 message ComputeRequest {
-  repeated float a_data = 1;   // row-major, shape [M, K]
-  repeated float b_data = 2;   // row-major, shape [K, N]
+  repeated float a_data = 1;   // row-major flattened, shape [M, K]
+  repeated float b_data = 2;   // row-major flattened, shape [K, N]
   int32 M = 3;
   int32 K = 4;
   int32 N = 5;
 }
 
 message ComputeResponse {
-  repeated float c_data = 1;   // row-major, shape [M, N]
+  repeated float c_data = 1;   // row-major flattened, shape [M, N]
   double server_compute_ms = 2;
 }
 
+// ── Sweep (square sizes) ──────────────────────────────────────────────────────
+
 message SweepRequest {
-  repeated int32 sizes = 1;
-  int32 iters  = 2;
-  int32 warmup = 3;
+  repeated int32 sizes = 1;   // square sizes, e.g. [128, 256, 512, 1024, 2048]
+  int32 iters  = 2;           // benchmark iterations per size (default 50)
+  int32 warmup = 3;           // warmup iterations (default 10)
 }
 
 message SweepResult {
-  int32  M      = 1;
-  int32  K      = 2;
-  int32  N      = 3;
-  double avg_ms = 4;
-  double p50_ms = 5;
-  double p99_ms = 6;
-  double gflops = 7;
+  int32  M       = 1;
+  int32  K       = 2;
+  int32  N       = 3;
+  double avg_ms  = 4;
+  double p50_ms  = 5;
+  double p99_ms  = 6;
+  double gflops  = 7;
 }
 
 message SweepResponse {
   repeated SweepResult results = 1;
+}
+
+// ── ShapeSweep (production shapes) ───────────────────────────────────────────
+
+message GEMMShape {
+  string model = 1;  // arbitrary label, e.g. "cvr", "adx"
+  int32  batch = 2;  // 1 = plain MatMul, >1 = BatchMatMul
+  int32  m     = 3;
+  int32  k     = 4;
+  int32  n     = 5;
+  int32  count = 6;  // how many times this op appears per inference pass
+}
+
+message ShapeSweepRequest {
+  repeated GEMMShape shapes = 1;
+  int32 iters  = 2;  // iterations per shape (default 100)
+  int32 warmup = 3;  // warmup iterations (default 20)
+}
+
+message ShapeResult {
+  GEMMShape shape = 1;
+  double avg_ms   = 2;
+  double p50_ms   = 3;
+  double p99_ms   = 4;
+  double gflops   = 5;
+}
+
+message ShapeSweepResponse {
+  repeated ShapeResult results = 1;
 }
